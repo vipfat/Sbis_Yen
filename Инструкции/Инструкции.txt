@@ -1,0 +1,37 @@
+Полезные Команды
+
+# Остановить бота
+sudo systemctl stop sbis_bot
+
+# Запустить
+sudo systemctl start sbis_bot
+
+# Перезапустить (после обновления кода, например)
+sudo systemctl restart sbis_bot
+
+# Посмотреть статус
+sudo systemctl status sbis_bot
+
+# Логи в реальном времени
+journalctl -u sbis_bot -f
+
+
+Для Обновления
+
+
+Делаешь в Git Bash:
+
+git add .
+git commit -m "Fixed act parsing"
+git push
+
+
+Идёшь на сервер:
+
+ssh bot@80.242.58.124
+cd ~/bot_app
+git pull
+sudo systemctl restart sbis_bot
+
+
+Бот обновлён.
