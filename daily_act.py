@@ -210,7 +210,6 @@ def build_native_xml(doc_kind: str,
                     "Цена": "0.00",
                 }
                 ET.SubElement(tab, "СтрТабл", row_attrs)
-                comp_index += 1
 
         line_index += 1
 
