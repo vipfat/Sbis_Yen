@@ -145,43 +145,69 @@ def build_native_xml(doc_kind: str,
             ET.SubElement(tab, "СтрТабл", row_attrs)
 
         else:
-            # ПРОИЗВОДСТВО / СПИСАНИЕ: техкарта + состав
-            recipe = build_components_for_output(name_input, output_qty=qty)
+            # ПРОИЗВОДСТВО / СПИСАНИЕ:
+            # 1) сначала пробуем реестр составов (полуфабрикаты)
+            # 2) если записи нет — считаем, что это обычный товар из Каталога
+            try:
+                recipe = build_components_for_output(name_input, output_qty=qty)
 
-            parent_name = recipe["parent_name"]
-            parent_code = recipe["parent_code"]
-            unit = recipe["parent_unit"]
-            okee = recipe["parent_okeei"]
+                parent_name = recipe["parent_name"]
+                parent_code = recipe["parent_code"]
+                unit = recipe["parent_unit"]
+                okee = recipe["parent_okeei"]
 
-            row_attrs = {
-                "Вместимость": "0",
-                "ЕдИзм": unit,
-                "ЗаказатьКодов": "0",
-                "Идентификатор": parent_code,
-                "Кол_во": f"{qty:.3f}",
-                "Название": parent_name,
-                "ОКЕИ": okee,
-                "ПорНомер": str(line_index),
-                "Сумма": "0.00",
-                "Цена": "0.00",
-            }
-            row = ET.SubElement(tab, "СтрТабл", row_attrs)
-
-            comp_index = 1
-            for comp in recipe["components"]:
-                comp_attrs = {
+                row_attrs = {
                     "Вместимость": "0",
-                    "ЕдИзм": comp["unit"],
-                    "Идентификатор": comp["code"],
-                    "Кол_во": f"{comp['qty']:.6f}",
-                    "Кол_во_План": f"{comp['qty']:.6f}",
-                    "Название": comp["name"],
-                    "ОКЕИ": comp["okeei"],
-                    "ПорНомер": str(comp_index),
+                    "ЕдИзм": unit,
+                    "ЗаказатьКодов": "0",
+                    "Идентификатор": parent_code,
+                    "Кол_во": f"{qty:.3f}",
+                    "Название": parent_name,
+                    "ОКЕИ": okee,
+                    "ПорНомер": str(line_index),
                     "Сумма": "0.00",
                     "Цена": "0.00",
                 }
-                ET.SubElement(row, "СоставСтрТабл", comp_attrs)
+                row = ET.SubElement(tab, "СтрТабл", row_attrs)
+
+                comp_index = 1
+                for comp in recipe["components"]:
+                    comp_attrs = {
+                        "Вместимость": "0",
+                        "ЕдИзм": comp["unit"],
+                        "Идентификатор": comp["code"],
+                        "Кол_во": f"{comp['qty']:.6f}",
+                        "Кол_во_План": f"{comp['qty']:.6f}",
+                        "Название": comp["name"],
+                        "ОКЕИ": comp["okeei"],
+                        "ПорНомер": str(comp_index),
+                        "Сумма": "0.00",
+                        "Цена": "0.00",
+                    }
+                    ET.SubElement(row, "СоставСтрТабл", comp_attrs)
+                    comp_index += 1
+
+            except Exception as e:
+                # Нет в реестре составов – считаем, что это просто товар из Каталога
+                print(
+                    f"[WARN] Для '{name_input}' нет записи в реестре составов, "
+                    f"использую прямой товар из Каталога: {e}"
+                )
+
+                meta = get_purchase_item(name_input)
+                row_attrs = {
+                    "Вместимость": "0",
+                    "ЕдИзм": meta["unit"],
+                    "ЗаказатьКодов": "0",
+                    "Идентификатор": meta["code"],
+                    "Кол_во": f"{qty:.3f}",
+                    "Название": meta["name"],
+                    "ОКЕИ": meta["okeei"],
+                    "ПорНомер": str(line_index),
+                    "Сумма": "0.00",
+                    "Цена": "0.00",
+                }
+                ET.SubElement(tab, "СтрТабл", row_attrs)
                 comp_index += 1
 
         line_index += 1
