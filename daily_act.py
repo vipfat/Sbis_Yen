@@ -185,7 +185,7 @@ def build_native_xml(doc_kind: str,
                         "Цена": "0.00",
                     }
                     ET.SubElement(row, "СоставСтрТабл", comp_attrs)
-                    comp_index += 1
+
 
             except Exception as e:
                 # Нет в реестре составов – считаем, что это просто товар из Каталога
