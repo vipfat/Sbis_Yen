@@ -13,7 +13,13 @@ from daily_act import (
     send_writeoff_act,
     send_income_act,
 )
-from ocr_gpt import extract_doc_from_image_gpt, correct_items_with_instruction
+from ocr_gpt import (
+    extract_doc_from_image_gpt,
+    correct_items_with_instruction,
+    align_items_with_catalog,
+)
+from catalog_lookup import DF_CAT
+from compositions import DF_COMP
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -62,11 +68,76 @@ def format_items(items: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def apply_catalog_alignment(chat_id: int, items: List[Dict]) -> List[Dict]:
+    """
+    Сверяем названия с Каталогом и Реестром через GPT, чтобы ловить опечатки/синонимы.
+    Автоматически подменяем уверенные совпадения, по сомнительным просим уточнить.
+    """
+
+    if not items:
+        return items
+
+    try:
+        matches = align_items_with_catalog(items, CATALOG_NAMES, REGISTRY_NAMES)
+    except Exception as e:
+        send_message(chat_id, f"Не смог сравнить с Каталогом/Реестром через GPT: {e}")
+        return items
+
+    updated_items: List[Dict] = []
+    auto_lines = []
+    unsure_lines = []
+
+    for it, mt in zip(items, matches):
+        name = it.get("name", "")
+        qty = it.get("qty")
+        matched = mt.get("matched_name") or name
+        confidence = float(mt.get("confidence", 0))
+        source = mt.get("source", "none")
+
+        if mt.get("matched_name") and source in {"catalog", "registry"}:
+            if confidence >= 0.72:
+                updated_items.append({"name": matched, "qty": qty})
+                if matched != name:
+                    auto_lines.append(
+                        f"- {name} → {matched} ({'Каталог' if source == 'catalog' else 'Реестр'}, уверенность {confidence:.2f})"
+                    )
+                continue
+            unsure_lines.append(
+                f"- {name} → {matched} ({'Каталог' if source == 'catalog' else 'Реестр'}, уверенность {confidence:.2f})"
+            )
+
+        # нет уверенного совпадения
+        updated_items.append({"name": matched, "qty": qty})
+
+    if auto_lines:
+        send_message(
+            chat_id,
+            "Подправил названия по Каталогу/Реестру:\n" + "\n".join(auto_lines),
+        )
+
+    if unsure_lines:
+        send_message(
+            chat_id,
+            "Есть сомнительные совпадения, уточни правильно ли я понял:\n"
+            + "\n".join(unsure_lines)
+            + "\n\nМожешь ответить чем заменить, например: 'картофель 5' или 'замени картошка на картофель'.",
+        )
+
+    return updated_items
+
+
 DOC_TYPE_LABELS = {
     "production": "Производство",
     "writeoff": "Списание",
     "income": "Приход",
 }
+
+CATALOG_NAMES = (
+    DF_CAT["Наименование"].astype(str).str.strip().dropna().unique().tolist()
+)
+REGISTRY_NAMES = (
+    DF_COMP["Родитель"].astype(str).str.strip().dropna().unique().tolist()
+)
 
 
 def handle_start(chat_id: int):
@@ -88,7 +159,9 @@ def handle_start(chat_id: int):
         "Команды:\n"
         "  /list — показать текущий список\n"
         "  /clear — очистить список\n"
-        "  /send <номер> [дд.мм.гггг] — вручную отправить акт с текущим списком (тип берётся из последнего фото)"
+        "  /send <номер> [дд.мм.гггг] — вручную отправить акт с текущим списком (тип берётся из последнего фото)\n\n"
+        "Можно без фото и команд: напиши Производство/Списание/Приход, затем позиции в формате «Название Количество»,"
+        " а для отправки — слово «отправить» (номер/дату придумаю сам)."
     )
 
 
@@ -244,7 +317,11 @@ def auto_send_act(chat_id: int):
     st = get_state(chat_id)
     items = st["items"]
     if not items:
-        send_message(chat_id, "Список пуст, нечего отправлять.")
+        send_message(
+            chat_id,
+            "Список пуст. Сначала выбери тип (Производство/Списание/Приход) "
+            "и добавь позиции в формате «Название Количество»."
+        )
         st["pending_confirm"] = False
         return
 
@@ -284,10 +361,36 @@ def is_yes(text: str) -> bool:
 def handle_text(chat_id: int, text: str):
     st = get_state(chat_id)
     text = text.strip()
+    text_lower = text.lower()
 
     # Команда?
     if text.startswith("/"):
         handle_command(chat_id, text)
+        return
+
+    # Быстрая смена типа документа текстом
+    if text_lower in {"производство", "списание", "приход"}:
+        new_doc_type = {
+            "производство": "production",
+            "списание": "writeoff",
+            "приход": "income",
+        }[text_lower]
+        st["doc_type"] = new_doc_type
+        st["items"] = []
+        st["pending_confirm"] = False
+
+        label = DOC_TYPE_LABELS.get(new_doc_type, new_doc_type)
+        send_message(
+            chat_id,
+            f"Режим: {label}.\n"
+            "Вводи позиции в формате «Название Количество».\n"
+            "Когда закончишь — напиши «отправить», я сам поставлю номер и дату."
+        )
+        return
+
+    # Явный запрос на отправку текущего списка
+    if text_lower in {"отправить", "отправь"}:
+        auto_send_act(chat_id)
         return
 
     # Если ждём подтверждение после OCR
@@ -303,8 +406,8 @@ def handle_text(chat_id: int, text: str):
             send_message(chat_id, f"Не смог применить правку через GPT: {e}")
             return
 
-        st["items"] = new_items
-        if not new_items:
+        st["items"] = apply_catalog_alignment(chat_id, new_items)
+        if not st["items"]:
             send_message(chat_id, "После правки список пуст. Можешь прислать новую фотку или ввести позиции заново.")
             st["pending_confirm"] = False
             return
@@ -314,7 +417,7 @@ def handle_text(chat_id: int, text: str):
             chat_id,
             f"Тип документа: {label}\n"
             "Обновлённый список позиций:\n"
-            + format_items(new_items)
+            + format_items(st["items"])
             + "\n\nВсе верно?"
         )
         # остаёмся в pending_confirm
@@ -334,6 +437,7 @@ def handle_text(chat_id: int, text: str):
 
     name = " ".join(parts[:-1])
     st["items"].append({"name": name, "qty": qty})
+    st["items"] = apply_catalog_alignment(chat_id, st["items"])
 
     send_message(chat_id, f"Добавил: {name} — {qty}")
 
@@ -385,7 +489,7 @@ def handle_photo(chat_id: int, photos: List[Dict]):
         send_message(chat_id, "Не нашёл ни одной строки с количеством на фото 😔")
         return
 
-    st["items"] = items
+    st["items"] = apply_catalog_alignment(chat_id, items)
     st["doc_type"] = doc_type
     st["pending_confirm"] = True
 
@@ -394,7 +498,7 @@ def handle_photo(chat_id: int, photos: List[Dict]):
         chat_id,
         f"Тип документа: {label}\n"
         "Нашёл такие позиции:\n"
-        + format_items(items)
+        + format_items(st["items"])
         + "\n\nВсе верно?"
     )
 
