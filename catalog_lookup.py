@@ -24,6 +24,26 @@ OKEI_BY_UNIT = {
 }
 
 
+def safe_price(value, default: float = 0.0) -> float:
+    """
+    Любая дичь в цене (пусто, пробелы, '—', 'н/д' и т.п.) -> default (0.0).
+    Нормальные числа/строки с запятой тоже понимает.
+    """
+    # Уже число
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    s = str(value).strip().replace(",", ".")
+    if not s:
+        return float(default)
+
+    try:
+        return float(s)
+    except ValueError:
+        print(f"[WARN] Мусор в цене: {value!r}, подставляю {default}")
+        return float(default)
+
+
 def resolve_purchase_name(name: str) -> str:
     """
     Ищем товар в Каталоге по названию.
@@ -62,7 +82,8 @@ def get_purchase_item(name: str) -> Dict:
       "name": <строго как в Каталоге>,
       "code": <Код>,
       "unit": <Единицы измерения>,
-      "okeei": <ОКЕИ>
+      "okeei": <ОКЕИ>,
+      "price": <закупочная цена (float)>
     }
     """
     canonical = resolve_purchase_name(name)
@@ -76,9 +97,9 @@ def get_purchase_item(name: str) -> Dict:
     unit = str(row["Единицы измерения"]).strip()
     code = str(row["Код"]).strip()
 
-    # <<< ПОДСТАВЬ СВОЁ НАЗВАНИЕ КОЛОНКИ В КАТАЛОГЕ >>>
-    # Например, если колонка называется "Закупочная цена":
-    purchase_price = float(row["Себест."])
+    # Берём цену из колонки "Себест." и безопасно приводим к float
+    raw_price = row["Себест."]
+    purchase_price = safe_price(raw_price, default=0.0)
 
     return {
         "name": canonical,
