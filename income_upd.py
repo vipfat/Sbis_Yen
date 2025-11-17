@@ -88,9 +88,30 @@ def build_income_upd_xml(doc_date: str, doc_number: str, daily_items: List[Dict]
     total_sum = 0.0
     total_qty = 0.0
 
+    total_sum = 0.0
+    total_qty = 0.0
+
     for idx, item in enumerate(daily_items, start=1):
-        name = item["name"]
-        qty = float(item["qty"])
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+
+        raw_qty = item.get("qty", "")
+
+        if isinstance(raw_qty, (int, float)):
+            qty = float(raw_qty)
+        else:
+            raw_str = str(raw_qty).strip()
+            if not raw_str:
+                continue
+            try:
+                qty = float(raw_str.replace(",", "."))
+            except ValueError:
+                print(f"[WARN] Пропускаю строку '{name}' в УПД, не могу понять количество: {raw_str!r}")
+                continue
+
+        if qty == 0:
+            continue
 
         meta = get_purchase_item(name)
         code = meta["code"]

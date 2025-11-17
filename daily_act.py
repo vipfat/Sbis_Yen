@@ -97,28 +97,34 @@ def build_native_xml(doc_kind: str,
 
     line_index = 1
     for item in daily_items:
-        # Чистим название
+        # Название строки
         name_input = str(item.get("name", "")).strip()
         if not name_input:
+            # пустое название – выбрасываем
             continue
 
-        # Чистим количество
+        # Сырые данные по количеству
         raw_qty = item.get("qty", "")
+
+        # 1) если уже число – просто приводим к float
         if isinstance(raw_qty, (int, float)):
             qty = float(raw_qty)
         else:
+            # 2) строка – чистим пробелы и пытаемся распарсить
             raw_str = str(raw_qty).strip()
             if not raw_str:
-                # пустая строка / пробелы — пропускаем
+                # было "", " ", "\t" и т.п. – пропускаем
                 continue
             try:
                 qty = float(raw_str.replace(",", "."))
             except ValueError:
-                # мусор типа "—", "ок", "шт" — тоже пропускаем
+                # вообще мусор (например "шт", "ок", "—") – пропускаем,
+                # но можно заодно лог вывести
+                print(f"[WARN] Пропускаю строку '{name_input}', не могу понять количество: {raw_str!r}")
                 continue
 
+        # 3) нулевые количества нам в акте не нужны
         if qty == 0:
-            # нулевые количества в акты не тащим
             continue
 
         if doc_kind == "income":
