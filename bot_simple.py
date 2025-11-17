@@ -88,7 +88,9 @@ def handle_start(chat_id: int):
         "Команды:\n"
         "  /list — показать текущий список\n"
         "  /clear — очистить список\n"
-        "  /send <номер> [дд.мм.гггг] — вручную отправить акт с текущим списком (тип берётся из последнего фото)"
+        "  /send <номер> [дд.мм.гггг] — вручную отправить акт с текущим списком (тип берётся из последнего фото)\n\n"
+        "Можно без фото и команд: напиши Производство/Списание/Приход, затем позиции в формате «Название Количество»,"
+        " а для отправки — слово «отправить» (номер/дату придумаю сам)."
     )
 
 
@@ -284,10 +286,36 @@ def is_yes(text: str) -> bool:
 def handle_text(chat_id: int, text: str):
     st = get_state(chat_id)
     text = text.strip()
+    text_lower = text.lower()
 
     # Команда?
     if text.startswith("/"):
         handle_command(chat_id, text)
+        return
+
+    # Быстрая смена типа документа текстом
+    if text_lower in {"производство", "списание", "приход"}:
+        new_doc_type = {
+            "производство": "production",
+            "списание": "writeoff",
+            "приход": "income",
+        }[text_lower]
+        st["doc_type"] = new_doc_type
+        st["items"] = []
+        st["pending_confirm"] = False
+
+        label = DOC_TYPE_LABELS.get(new_doc_type, new_doc_type)
+        send_message(
+            chat_id,
+            f"Режим: {label}.\n"
+            "Вводи позиции в формате «Название Количество».\n"
+            "Когда закончишь — напиши «отправить», я сам поставлю номер и дату."
+        )
+        return
+
+    # Явный запрос на отправку текущего списка
+    if text_lower == "отправить":
+        auto_send_act(chat_id)
         return
 
     # Если ждём подтверждение после OCR
