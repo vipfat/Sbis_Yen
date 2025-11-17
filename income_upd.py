@@ -1,4 +1,3 @@
-# income_upd.py
 import base64
 import uuid
 from copy import deepcopy
@@ -22,8 +21,34 @@ def _fmt_qty(x: float) -> str:
     return s if s else "0"
 
 
-def _fmt_money(x: float) -> str:
-    return f"{float(x):.2f}".replace(",", ".")
+def _to_float_safe(val, default: float = 0.0) -> float:
+    """
+    Аккуратно приводим к float:
+    - режем пробелы
+    - меняем запятую на точку
+    - пустое => default
+    - мусор => предупреждение и default
+    """
+    if isinstance(val, (int, float)):
+        return float(val)
+
+    s = str(val).strip().replace(",", ".")
+    if not s:
+        return float(default)
+
+    try:
+        return float(s)
+    except ValueError:
+        print(f"[WARN] Не могу привести к float: {val!r}, беру {default}")
+        return float(default)
+
+
+def _fmt_money(x) -> str:
+    """
+    Деньги в формате 0.00, с точкой. x может быть строкой или числом.
+    """
+    value = _to_float_safe(x, default=0.0)
+    return f"{value:.2f}".replace(",", ".")
 
 
 def _extract_seller_inn(root) -> str:
@@ -88,9 +113,6 @@ def build_income_upd_xml(doc_date: str, doc_number: str, daily_items: List[Dict]
     total_sum = 0.0
     total_qty = 0.0
 
-    total_sum = 0.0
-    total_qty = 0.0
-
     for idx, item in enumerate(daily_items, start=1):
         name = str(item.get("name", "")).strip()
         if not name:
@@ -98,11 +120,13 @@ def build_income_upd_xml(doc_date: str, doc_number: str, daily_items: List[Dict]
 
         raw_qty = item.get("qty", "")
 
+        # Кол-во — аккуратно парсим
         if isinstance(raw_qty, (int, float)):
             qty = float(raw_qty)
         else:
             raw_str = str(raw_qty).strip()
             if not raw_str:
+                # пустое количество вообще не берём в УПД
                 continue
             try:
                 qty = float(raw_str.replace(",", "."))
@@ -111,15 +135,20 @@ def build_income_upd_xml(doc_date: str, doc_number: str, daily_items: List[Dict]
                 continue
 
         if qty == 0:
+            # нулевые строки нам в приходе не нужны
             continue
 
+        # Берём данные из каталога
         meta = get_purchase_item(name)
         code = meta["code"]
         unit = meta["unit"]
         okee = meta.get("okeei", "")
         full_name = meta["name"]
 
-        price = float(meta.get("price", 0.0))
+        # >>> ТУТ БЫЛА ПРОБЛЕМА <<<
+        raw_price = meta.get("price", 0.0)
+        price = _to_float_safe(raw_price, default=0.0)
+
         line_sum = qty * price
 
         total_sum += line_sum
