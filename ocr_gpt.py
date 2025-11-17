@@ -214,3 +214,80 @@ def correct_items_with_instruction(items: List[Dict], instruction: str) -> List[
         norm_items.append({"name": name, "qty": qty_val})
 
     return norm_items
+
+
+def align_items_with_catalog(
+    items: List[Dict],
+    catalog_names: List[str],
+    registry_names: List[str],
+    temperature: float = 0,
+) -> List[Dict]:
+    """
+    Сопоставляет названия позиций со справочниками Каталога и Реестра составов.
+
+    Возвращает массив объектов того же размера, что и items, где для каждой позиции:
+      {
+        "original_name": <исходное имя>,
+        "matched_name": <имя из справочника или "">,
+        "source": "catalog" | "registry" | "none",
+        "confidence": 0..1,
+        "comment": <пояснение, опционально>
+      }
+    """
+
+    if not items:
+        return []
+
+    catalog_list = "\n".join(f"- {n}" for n in catalog_names)
+    registry_list = "\n".join(f"- {n}" for n in registry_names)
+
+    items_json = json.dumps(items, ensure_ascii=False)
+
+    prompt = (
+        "Ты помогатор, который по нестрогим названиям сопоставляет товары/полуфабрикаты "
+        "со справочниками кафе.\n\n"
+        "У тебя есть два справочника: Каталог (закупка/приход) и Реестр составов "
+        "(производство/списание). Используй только эти точные строки, ничего не придумывай.\n\n"
+        "Каталог (точные имена):\n"
+        f"{catalog_list}\n\n"
+        "Реестр составов (точные имена родителя):\n"
+        f"{registry_list}\n\n"
+        "На входе список позиций (name, qty). Для каждого name нужно вернуть JSON-объект:\n"
+        "- original_name — исходное имя\n"
+        "- matched_name — точное имя из каталога/реестра или пустая строка, если уверенности нет\n"
+        "- source — 'catalog', 'registry' или 'none'\n"
+        "- confidence — число 0..1 (0.9 если почти уверен, 0.5 если догадка)\n"
+        "- comment — краткое пояснение, если нужно (например: 'синоним картофель')\n\n"
+        "Важно: matched_name обязан быть ровно из списков выше, если ты его выбрал.\n"
+        "Верни только JSON-массив такого вида, без текста и пояснений.\n\n"
+        f"Позиции:\n{items_json}"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1200,
+        temperature=temperature,
+    )
+
+    text = response.choices[0].message.content or ""
+    raw = _parse_json_strict_or_relaxed(text)
+
+    if not isinstance(raw, list):
+        raise RuntimeError(f"Ожидался JSON-массив сопоставлений, а пришло:\n{text}")
+
+    normalized = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        normalized.append(
+            {
+                "original_name": str(it.get("original_name", "")).strip(),
+                "matched_name": str(it.get("matched_name", "")).strip(),
+                "source": str(it.get("source", "none")).strip().lower(),
+                "confidence": float(it.get("confidence", 0) or 0),
+                "comment": str(it.get("comment", "")).strip(),
+            }
+        )
+
+    return normalized
