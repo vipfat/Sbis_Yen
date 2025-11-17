@@ -76,9 +76,22 @@ def get_purchase_item(name: str) -> Dict:
     unit = str(row["Единицы измерения"]).strip()
     code = str(row["Код"]).strip()
 
-    # <<< ПОДСТАВЬ СВОЁ НАЗВАНИЕ КОЛОНКИ В КАТАЛОГЕ >>>
-    # Например, если колонка называется "Закупочная цена":
-    purchase_price = float(row["Себест."])
+# Всегда безопасно приводим цену к float, пустота → 0
+raw_price = row["Себест."]
+
+def safe_price(x):
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip().replace(",", ".")
+    if not s:           # пустая ячейка или пробелы
+        return 0.0
+    try:
+        return float(s)
+    except:
+        print(f"[WARN] Мусор в цене '{x}', ставлю 0.0")
+        return 0.0
+
+purchase_price = safe_price(raw_price)
 
     return {
         "name": canonical,
