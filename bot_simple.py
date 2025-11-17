@@ -108,6 +108,47 @@ def handle_clear(chat_id: int):
     st["pending_confirm"] = False
     send_message(chat_id, "Список очищен.")
 
+def split_valid_invalid_items(items: List[Dict]):
+    """
+    Делим позиции на:
+      - валидные (нормальное количество)
+      - проблемные (пусто/мусор/ноль)
+    """
+    valid = []
+    bad = []
+
+    for it in items:
+        name = str(it.get("name", "")).strip()
+        if not name:
+            continue
+
+        raw = it.get("qty", "")
+        raw_str = ""
+        qty = None
+
+        # Уже число?
+        if isinstance(raw, (int, float)):
+            qty = float(raw)
+            raw_str = str(raw)
+        else:
+            raw_str = str(raw).strip()
+            if not raw_str:
+                bad.append({"name": name, "qty_raw": raw_str, "reason": "empty"})
+                continue
+            try:
+                qty = float(raw_str.replace(",", "."))
+            except ValueError:
+                bad.append({"name": name, "qty_raw": raw_str, "reason": "invalid"})
+                continue
+
+        if qty == 0:
+            bad.append({"name": name, "qty_raw": raw_str, "reason": "zero"})
+            continue
+
+        valid.append({"name": name, "qty": qty})
+
+    return valid, bad
+
 
 def send_act_by_type(chat_id: int,
                      doc_type: str,
@@ -116,24 +157,51 @@ def send_act_by_type(chat_id: int,
                      items: List[Dict]):
     """
     Вызов нужной функции отправки в СБИС по типу документа.
+    Перед этим чистим список от мусора и предупреждаем о битых строках.
     """
+    # Сначала делим позиции на валидные и сломанные
+    valid_items, bad_items = split_valid_invalid_items(items)
+
+    if not valid_items:
+        send_message(
+            chat_id,
+            "Во всех позициях пустое или некорректное количество. "
+            "Акт не отправил.\n"
+            "Исправь строки (например: «Помидор 1.2») и попробуй ещё раз."
+        )
+        return
+
+    if bad_items:
+        lines = []
+        for b in bad_items:
+            q = b["qty_raw"] if b["qty_raw"] else "пусто"
+            lines.append(f"- {b['name']} (количество: {q})")
+        msg = (
+            "⚠ Эти позиции я не смог обработать, потому что количество пустое, ноль или непонятное:\n"
+            + "\n".join(lines)
+            + "\n\nЯ их в акт НЕ отправляю.\n"
+            "Если они нужны — введи их заново в формате «Название Количество» "
+            "или поправь через фразу типа «помидор не  , а 1.2», и я пересоберу список."
+        )
+        send_message(chat_id, msg)
+
     label = DOC_TYPE_LABELS.get(doc_type, doc_type)
     send_message(
         chat_id,
         f"Отправляю акт ({label}) №{doc_number} от {doc_date}.\n"
-        f"Позиций: {len(items)}"
+        f"Позиций: {len(valid_items)}"
     )
 
     try:
         if doc_type == "production":
-            result = send_daily_act(doc_date, doc_number, items)
+            result = send_daily_act(doc_date, doc_number, valid_items)
         elif doc_type == "writeoff":
-            result = send_writeoff_act(doc_date, doc_number, items)
+            result = send_writeoff_act(doc_date, doc_number, valid_items)
         elif doc_type == "income":
-            result = send_income_act(doc_date, doc_number, items)
+            result = send_income_act(doc_date, doc_number, valid_items)
         else:
             # fallback — как производство
-            result = send_daily_act(doc_date, doc_number, items)
+            result = send_daily_act(doc_date, doc_number, valid_items)
     except Exception as e:
         send_message(chat_id, f"Ошибка при формировании/отправке акта: {e}")
         return
@@ -164,6 +232,7 @@ def handle_send_manual(chat_id: int, args: List[str]):
     else:
         doc_date = datetime.today().strftime("%d.%m.%Y")
 
+    # Здесь автоматически отфильтруем мусор и предупредим, если что
     send_act_by_type(chat_id, st["doc_type"], doc_date, doc_number, items)
 
 
@@ -183,6 +252,7 @@ def auto_send_act(chat_id: int):
     doc_date = now.strftime("%d.%m.%Y")
     doc_number = now.strftime("BOT-%Y%m%d-%H%M%S")
 
+    # Тут же сработает split_valid_invalid_items, бот предупредит о кривых строках
     send_act_by_type(chat_id, st["doc_type"], doc_date, doc_number, items)
 
 

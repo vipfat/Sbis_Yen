@@ -77,8 +77,7 @@ def build_native_xml(doc_kind: str,
     Собираем XML, который кладем во вложение.
 
     Для production/writeoff – это native 3.01.
-    Для income – пока используем ту же простую структуру, но с другим "Формат".
-    (Если СБИС потом начнет ругаться на само тело УПД, будем ближе подгонять под ON_NSCHFDOPPR.)
+    Для income – используем ту же простую структуру, но с другим "Формат".
     """
     kind = DOC_KINDS.get(doc_kind)
     if not kind:
@@ -98,8 +97,29 @@ def build_native_xml(doc_kind: str,
 
     line_index = 1
     for item in daily_items:
-        name_input = item["name"]
-        qty = float(item["qty"])
+        # Чистим название
+        name_input = str(item.get("name", "")).strip()
+        if not name_input:
+            continue
+
+        # Чистим количество
+        raw_qty = item.get("qty", "")
+        if isinstance(raw_qty, (int, float)):
+            qty = float(raw_qty)
+        else:
+            raw_str = str(raw_qty).strip()
+            if not raw_str:
+                # пустая строка / пробелы — пропускаем
+                continue
+            try:
+                qty = float(raw_str.replace(",", "."))
+            except ValueError:
+                # мусор типа "—", "ок", "шт" — тоже пропускаем
+                continue
+
+        if qty == 0:
+            # нулевые количества в акты не тащим
+            continue
 
         if doc_kind == "income":
             # ПРИХОД: берём товар из Каталога, без составов
