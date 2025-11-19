@@ -4,7 +4,9 @@ import io
 import os
 import json
 import re
+import logging
 from collections import Counter
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 from dotenv import load_dotenv
@@ -19,6 +21,17 @@ if not OPENAI_API_KEY:
     raise RuntimeError("В .env не найден OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+LOGGER = logging.getLogger("ocr_tables")
+if not LOGGER.handlers:
+    handler = logging.FileHandler(LOG_DIR / "ocr_tables.log", encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    LOGGER.addHandler(handler)
+LOGGER.setLevel(logging.INFO)
 
 
 def encode_image(image_path: str, crop_box: Optional[Tuple[int, int, int, int]] = None) -> str:
@@ -37,68 +50,132 @@ def encode_image(image_path: str, crop_box: Optional[Tuple[int, int, int, int]] 
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def _segment_axis(
+    activity_mask: np.ndarray,
+    min_length: int,
+    min_gap: int,
+    margin: int,
+    limit: int,
+) -> List[Tuple[int, int]]:
+    """Находит активные непрерывные участки с запасом по краям."""
+
+    segments: List[Tuple[int, int]] = []
+    start: Optional[int] = None
+    gap = 0
+
+    for idx, active in enumerate(activity_mask):
+        if active:
+            if start is None:
+                start = idx
+            gap = 0
+            continue
+
+        if start is None:
+            continue
+
+        gap += 1
+        if gap >= min_gap:
+            end = idx - gap
+            length = end - start
+            if length >= min_length:
+                seg_start = max(start - margin, 0)
+                seg_end = min(end + margin + 1, limit)
+                segments.append((seg_start, seg_end))
+            start = None
+            gap = 0
+
+    if start is not None:
+        end = len(activity_mask) - 1
+        length = end - start
+        if length >= min_length:
+            seg_start = max(start - margin, 0)
+            seg_end = min(end + margin + 1, limit)
+            segments.append((seg_start, seg_end))
+
+    return segments
+
+
 def detect_table_regions(
     image_path: str,
     content_threshold: float = 0.015,
     min_table_height: int = 200,
     min_gap_height: int = 50,
     margin: int = 10,
+    column_threshold: float = 0.02,
+    min_column_width: int = 150,
+    min_column_gap: int = 40,
 ) -> List[Tuple[int, int, int, int]]:
     """
-    Поиск горизонтально расположенных таблиц на листе.
+    Поиск таблиц на листе. Работает как по горизонтали, так и по вертикали,
+    чтобы корректно обрабатывать листы с несколькими колонками таблиц.
     Возвращает список crop-box (left, top, right, bottom).
-    Если найти отдельные таблицы не получилось, возвращает весь лист.
     """
+
     try:
         with Image.open(image_path) as img:
             gray = img.convert("L")
             width, height = img.size
             arr = np.array(gray)
     except Exception:
-        # Если не получилось загрузить — пусть дальше отработает весь лист целиком
         with Image.open(image_path) as img:
             width, height = img.size
         return [(0, 0, width, height)]
 
-    # Оцениваем «насыщенность» каждой строки: сколько пикселей не похоже на фон
     row_activity = (arr < 230).mean(axis=1)
-    has_content = row_activity > content_threshold
+    has_row_content = row_activity > content_threshold
+    row_segments = _segment_axis(
+        has_row_content, min_table_height, min_gap_height, margin, height
+    )
+    if not row_segments:
+        row_segments = [(0, height)]
 
     boxes: List[Tuple[int, int, int, int]] = []
-    start = None
-    gap = 0
 
-    def flush_segment(end_row: int):
-        nonlocal start
-        if start is None:
-            return
-        if end_row - start < min_table_height:
-            start = None
-            return
-        top = max(start - margin, 0)
-        bottom = min(end_row + margin, height - 1)
-        boxes.append((0, top, width, bottom + 1))  # нижняя граница в PIL эксклюзивна
-        start = None
+    for top, bottom in row_segments:
+        slice_arr = arr[top:bottom, :]
+        if slice_arr.size == 0:
+            continue
+        column_activity = (slice_arr < 230).mean(axis=0)
+        has_column_content = column_activity > column_threshold
+        column_segments = _segment_axis(
+            has_column_content, min_column_width, min_column_gap, margin, width
+        )
+        if not column_segments:
+            boxes.append((0, top, width, bottom))
+            continue
+        for left, right in column_segments:
+            boxes.append((left, top, right, bottom))
 
-    for y, active in enumerate(has_content):
-        if active:
-            if start is None:
-                start = y
-            gap = 0
-        else:
-            if start is not None:
-                gap += 1
-                if gap >= min_gap_height:
-                    flush_segment(y - gap)
-                    gap = 0
-
-    if start is not None:
-        flush_segment(len(has_content) - 1)
-
-    if len(boxes) <= 1:
+    if not boxes:
         return [(0, 0, width, height)]
 
     return boxes
+
+
+def save_table_crops(image_path: str, boxes: List[Tuple[int, int, int, int]]) -> List[str]:
+    """Сохраняет нарезанные кусочки таблиц для отладки."""
+
+    saved_paths: List[str] = []
+    if not boxes:
+        return saved_paths
+
+    parts_dir = Path("tmp_images") / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with Image.open(image_path) as img:
+            stem = Path(image_path).stem
+            for idx, box in enumerate(boxes, start=1):
+                crop = img.crop(box)
+                out_path = parts_dir / f"{stem}_part{idx}.jpg"
+                crop.save(out_path, format="JPEG", quality=95)
+                saved_paths.append(str(out_path))
+    except Exception as exc:
+        LOGGER.warning(
+            "Не удалось сохранить вырезанные таблицы для %s: %s", image_path, exc
+        )
+
+    return saved_paths
 
 
 def _normalize_doc_result(raw: Dict) -> Dict:
@@ -229,8 +306,18 @@ def extract_doc_from_image_gpt(image_path: str) -> Dict:
     """
     boxes = detect_table_regions(image_path)
 
+    saved_parts: List[str] = []
+    if len(boxes) > 1:
+        saved_parts = save_table_crops(image_path, boxes)
+        LOGGER.info(
+            "Фото %s разделено на %d частей. Кусочки: %s",
+            image_path,
+            len(boxes),
+            ", ".join(saved_parts) if saved_parts else "не удалось сохранить вырезки",
+        )
+
     if len(boxes) <= 1:
-        result = _extract_single_table(image_path, None)
+        result = _extract_single_table(image_path, boxes[0] if boxes else None)
         result["tables_processed"] = 1
         return result
 
