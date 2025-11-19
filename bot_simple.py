@@ -408,6 +408,7 @@ def handle_photo(chat_id: int, photos: List[Dict]):
 
     doc_type = doc.get("doc_type", "production")
     items = doc.get("items", [])
+    tables_processed = doc.get("tables_processed", 1)
 
     if not items:
         send_message(chat_id, "Не нашёл ни одной строки с количеством на фото 😔")
@@ -418,11 +419,18 @@ def handle_photo(chat_id: int, photos: List[Dict]):
     st["pending_confirm"] = True
 
     label = DOC_TYPE_LABELS.get(doc_type, doc_type)
+    tables_comment = ""
+    if tables_processed > 1:
+        tables_comment = (
+            f"\n(На фото было найдено {tables_processed} таблиц подряд, "
+            "я разделил их и объединил результаты.)"
+        )
     send_message(
         chat_id,
         f"Тип документа: {label}\n"
         "Нашёл такие позиции:\n"
         + format_items(items)
+        + tables_comment
         + "\n\nВсе верно?"
     )
 

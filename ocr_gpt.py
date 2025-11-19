@@ -1,12 +1,16 @@
 # ocr_gpt.py
 import base64
+import io
 import os
 import json
 import re
-from typing import List, Dict
+from collections import Counter
+from typing import List, Dict, Tuple, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
+import numpy as np
+from PIL import Image
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -17,43 +21,115 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-def encode_image(image_path: str) -> str:
-    """Преобразуем картинку в base64 для передачи в GPT."""
-    with open(image_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-def _parse_json_strict_or_relaxed(text: str):
+def encode_image(image_path: str, crop_box: Optional[Tuple[int, int, int, int]] = None) -> str:
     """
-    Пытаемся аккуратно вытащить JSON из ответа GPT.
-    Сначала пробуем как есть, потом ищем { ... } или [ ... ].
+    Преобразуем картинку (или её часть) в base64 для передачи в GPT.
+    crop_box — (left, top, right, bottom) как в PIL.Image.crop.
     """
-    text = (text or "").strip()
+    if crop_box is None:
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
 
-    # Пробуем как есть
+    with Image.open(image_path) as img:
+        cropped = img.crop(crop_box)
+        buf = io.BytesIO()
+        cropped.save(buf, format="JPEG", quality=95)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def detect_table_regions(
+    image_path: str,
+    content_threshold: float = 0.015,
+    min_table_height: int = 200,
+    min_gap_height: int = 50,
+    margin: int = 10,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Поиск горизонтально расположенных таблиц на листе.
+    Возвращает список crop-box (left, top, right, bottom).
+    Если найти отдельные таблицы не получилось, возвращает весь лист.
+    """
     try:
-        return json.loads(text)
+        with Image.open(image_path) as img:
+            gray = img.convert("L")
+            width, height = img.size
+            arr = np.array(gray)
     except Exception:
-        pass
+        # Если не получилось загрузить — пусть дальше отработает весь лист целиком
+        with Image.open(image_path) as img:
+            width, height = img.size
+        return [(0, 0, width, height)]
 
-    # Ищем JSON-объект или массив
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        m = re.search(r"\[.*\]", text, re.S)
-    if not m:
-        raise RuntimeError(f"GPT вернул невалидный JSON:\n{text}")
-    return json.loads(m.group(0))
+    # Оцениваем «насыщенность» каждой строки: сколько пикселей не похоже на фон
+    row_activity = (arr < 230).mean(axis=1)
+    has_content = row_activity > content_threshold
+
+    boxes: List[Tuple[int, int, int, int]] = []
+    start = None
+    gap = 0
+
+    def flush_segment(end_row: int):
+        nonlocal start
+        if start is None:
+            return
+        if end_row - start < min_table_height:
+            start = None
+            return
+        top = max(start - margin, 0)
+        bottom = min(end_row + margin, height - 1)
+        boxes.append((0, top, width, bottom + 1))  # нижняя граница в PIL эксклюзивна
+        start = None
+
+    for y, active in enumerate(has_content):
+        if active:
+            if start is None:
+                start = y
+            gap = 0
+        else:
+            if start is not None:
+                gap += 1
+                if gap >= min_gap_height:
+                    flush_segment(y - gap)
+                    gap = 0
+
+    if start is not None:
+        flush_segment(len(has_content) - 1)
+
+    if len(boxes) <= 1:
+        return [(0, 0, width, height)]
+
+    return boxes
 
 
-def extract_doc_from_image_gpt(image_path: str) -> Dict:
-    """
-    Отправляет фото таблицы в GPT и возвращает структуру:
-    {
-      "doc_type": "production" | "writeoff" | "income",
-      "items": [ {"name": "...", "qty": float}, ... ]
-    }
-    """
-    b64 = encode_image(image_path)
+def _normalize_doc_result(raw: Dict) -> Dict:
+    doc_type = raw.get("doc_type", "").strip()
+    items_raw = raw.get("items", [])
+
+    if doc_type not in ("production", "writeoff", "income"):
+        doc_type = "production"
+
+    items: List[Dict] = []
+    if isinstance(items_raw, list):
+        for it in items_raw:
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("name", "")).strip()
+            qty = it.get("qty")
+            if not name:
+                continue
+            try:
+                qty_val = float(qty)
+            except (TypeError, ValueError):
+                continue
+            if qty_val == 0:
+                continue
+            items.append({"name": name, "qty": qty_val})
+
+    return {"doc_type": doc_type, "items": items}
+
+
+def _extract_single_table(image_path: str, crop_box: Optional[Tuple[int, int, int, int]] = None) -> Dict:
+    b64 = encode_image(image_path, crop_box)
 
     prompt = """
 Ты — система распознавания таблиц для кафе.
@@ -120,35 +196,62 @@ def extract_doc_from_image_gpt(image_path: str) -> Dict:
     if not isinstance(raw, dict):
         raise RuntimeError(f"Ожидался JSON-объект, а пришло:\n{text}")
 
-    doc_type = raw.get("doc_type", "").strip()
-    items_raw = raw.get("items", [])
+    return _normalize_doc_result(raw)
 
-    # Нормализуем doc_type
-    if doc_type not in ("production", "writeoff", "income"):
-        # если GPT тупанул — по умолчанию считаем производством
-        doc_type = "production"
 
-    # Нормализуем список позиций
-    items: List[Dict] = []
-    if isinstance(items_raw, list):
-        for it in items_raw:
-            if not isinstance(it, dict):
-                continue
-            name = str(it.get("name", "")).strip()
-            qty = it.get("qty")
-            if not name:
-                continue
-            try:
-                qty_val = float(qty)
-            except (TypeError, ValueError):
-                continue
-            if qty_val == 0:
-                continue
-            items.append({"name": name, "qty": qty_val})
+def _parse_json_strict_or_relaxed(text: str):
+    """
+    Пытаемся аккуратно вытащить JSON из ответа GPT.
+    Сначала пробуем как есть, потом ищем { ... } или [ ... ].
+    """
+    text = (text or "").strip()
+
+    # Пробуем как есть
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Ищем JSON-объект или массив
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        m = re.search(r"\[.*\]", text, re.S)
+    if not m:
+        raise RuntimeError(f"GPT вернул невалидный JSON:\n{text}")
+    return json.loads(m.group(0))
+
+
+def extract_doc_from_image_gpt(image_path: str) -> Dict:
+    """
+    Отправляет фото таблицы в GPT.
+    Если на фото несколько таблиц подряд, они будут автоматически выделены,
+    распознаны по отдельности и объединены в один список.
+    """
+    boxes = detect_table_regions(image_path)
+
+    if len(boxes) <= 1:
+        result = _extract_single_table(image_path, None)
+        result["tables_processed"] = 1
+        return result
+
+    doc_type_counter: Counter = Counter()
+    combined_items: List[Dict] = []
+
+    for box in boxes:
+        part_doc = _extract_single_table(image_path, box)
+        doc_type_counter[part_doc.get("doc_type", "production")] += 1
+        combined_items.extend(part_doc.get("items", []))
+
+    dominant_doc_type = (
+        doc_type_counter.most_common(1)[0][0]
+        if doc_type_counter
+        else "production"
+    )
 
     return {
-        "doc_type": doc_type,
-        "items": items,
+        "doc_type": dominant_doc_type,
+        "items": combined_items,
+        "tables_processed": len(boxes),
     }
 
 
