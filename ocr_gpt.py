@@ -1,9 +1,16 @@
 # ocr_gpt.py
 import base64
-import os
 import json
+import os
 import re
-from typing import List, Dict
+import shutil
+import tempfile
+from collections import Counter
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -15,6 +22,93 @@ if not OPENAI_API_KEY:
     raise RuntimeError("В .env не найден OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+def _load_image(image_path: str):
+    path = Path(image_path)
+    image = cv2.imread(str(path))
+    return path, image
+
+
+def _find_table_regions(binary: np.ndarray) -> List[Tuple[int, int]]:
+    """Ищем крупные горизонтальные блоки с данными (таблицы)."""
+
+    h, w = binary.shape[:2]
+    if h == 0:
+        return []
+
+    projection = np.sum(binary > 0, axis=1)
+    blank_threshold = max(1, int(0.01 * w))
+    is_blank = projection <= blank_threshold
+
+    min_gap = max(25, int(0.015 * h))
+    separators: List[Tuple[int, int]] = []
+    i = 0
+    while i < h:
+        if is_blank[i]:
+            j = i
+            while j < h and is_blank[j]:
+                j += 1
+            if (j - i) >= min_gap:
+                separators.append((i, j))
+            i = j
+        else:
+            i += 1
+
+    if not separators:
+        return []
+
+    regions: List[Tuple[int, int]] = []
+    start = 0
+    for sep_start, sep_end in separators:
+        regions.append((start, sep_start))
+        start = sep_end
+    regions.append((start, h))
+
+    min_table_height = max(120, int(0.12 * h))
+    filtered = [r for r in regions if (r[1] - r[0]) >= min_table_height]
+
+    if len(filtered) >= 2:
+        return filtered
+
+    # Если не нашли два крупных блока — считаем, что таблица одна
+    return []
+
+
+def split_image_into_tables(image_path: str) -> Tuple[List[Path], Optional[Path]]:
+    """Определяет количество таблиц и при необходимости режет фото на части."""
+
+    path, image = _load_image(image_path)
+    if image is None:
+        return [path], None
+
+    h, w = image.shape[:2]
+    if h < 400 or w < 400:
+        return [path], None
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    binary = 255 - binary
+
+    regions = _find_table_regions(binary)
+    if len(regions) < 2:
+        return [path], None
+
+    padding = max(15, int(0.01 * h))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="tables_", dir=str(path.parent)))
+    saved_paths: List[Path] = []
+    base_name = path.stem
+
+    for idx, (top, bottom) in enumerate(regions, start=1):
+        t = max(0, top - padding)
+        b = min(h, bottom + padding)
+        crop = image[t:b, :]
+        out_path = tmp_dir / f"{base_name}_part{idx}.jpg"
+        cv2.imwrite(str(out_path), crop)
+        saved_paths.append(out_path)
+
+    return saved_paths, tmp_dir
 
 
 def encode_image(image_path: str) -> str:
@@ -45,7 +139,7 @@ def _parse_json_strict_or_relaxed(text: str):
     return json.loads(m.group(0))
 
 
-def extract_doc_from_image_gpt(image_path: str) -> Dict:
+def _extract_doc_from_image_gpt_single(image_path: str) -> Dict:
     """
     Отправляет фото таблицы в GPT и возвращает структуру:
     {
@@ -149,6 +243,39 @@ def extract_doc_from_image_gpt(image_path: str) -> Dict:
     return {
         "doc_type": doc_type,
         "items": items,
+    }
+
+
+def extract_doc_from_image_gpt(image_path: str) -> Dict:
+    """Распознаёт таблицу (или несколько таблиц подряд) и объединяет результат."""
+
+    parts, tmp_dir = split_image_into_tables(image_path)
+    doc_type_counter: Counter = Counter()
+    combined_items: List[Dict] = []
+    detected_types: List[str] = []
+
+    try:
+        for part in parts:
+            doc = _extract_doc_from_image_gpt_single(str(part))
+            doc_type = doc.get("doc_type", "production")
+            detected_types.append(doc_type)
+            weight = max(1, len(doc.get("items", [])))
+            doc_type_counter[doc_type] += weight
+            combined_items.extend(doc.get("items", []))
+    finally:
+        if tmp_dir and tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if doc_type_counter:
+        final_doc_type = doc_type_counter.most_common(1)[0][0]
+    elif detected_types:
+        final_doc_type = detected_types[0]
+    else:
+        final_doc_type = "production"
+
+    return {
+        "doc_type": final_doc_type,
+        "items": combined_items,
     }
 
 
