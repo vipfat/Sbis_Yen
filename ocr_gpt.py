@@ -152,6 +152,18 @@ def extract_doc_from_image_gpt(image_path: str) -> Dict:
     }
 
 
+def transcribe_voice(audio_path: str) -> str:
+    """Преобразуем голосовое сообщение в текст с помощью Whisper."""
+    with open(audio_path, "rb") as audio_file:
+        result = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            language="ru",
+        )
+
+    return result.text.strip()
+
+
 def correct_items_with_instruction(items: List[Dict], instruction: str) -> List[Dict]:
     """
     Принимает текущий список items и текстовую инструкцию (на русском),
