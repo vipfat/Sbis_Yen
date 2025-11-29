@@ -1,6 +1,5 @@
 # bot_simple.py
 import os
-import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -14,12 +13,7 @@ from daily_act import (
     send_writeoff_act,
     send_income_act,
 )
-from name_matching import align_items_with_catalog
-from ocr_gpt import (
-    correct_items_with_instruction,
-    extract_doc_from_image_gpt,
-    transcribe_voice,
-)
+from ocr_gpt import extract_doc_from_image_gpt, correct_items_with_instruction
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -68,51 +62,11 @@ def format_items(items: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-DOC_TYPE_BY_WORD = {
-    "производство": "production",
-    "списание": "writeoff",
-    "приход": "income",
-}
-
-
 DOC_TYPE_LABELS = {
     "production": "Производство",
     "writeoff": "Списание",
     "income": "Приход",
 }
-
-NUM_TOKEN_RE = re.compile(r"^-?\d+(?:[.,]\d+)?$")
-
-
-def parse_doc_type_and_items(text: str):
-    """Выдёргиваем тип документа и пары «название количество» из одной строки."""
-    tokens = text.split()
-    doc_type = None
-
-    if tokens and tokens[0].lower().rstrip(":") in DOC_TYPE_BY_WORD:
-        doc_type = DOC_TYPE_BY_WORD[tokens[0].lower().rstrip(":")]
-        tokens = tokens[1:]
-
-    items: List[Dict] = []
-    current_name_parts: List[str] = []
-
-    for token in tokens:
-        cleaned = token.strip(",.;")
-        if NUM_TOKEN_RE.match(cleaned):
-            if current_name_parts:
-                name = " ".join(current_name_parts).strip()
-                if name:
-                    try:
-                        qty = float(cleaned.replace(",", "."))
-                    except ValueError:
-                        qty = None
-                    if qty is not None:
-                        items.append({"name": name, "qty": qty})
-            current_name_parts = []
-        else:
-            current_name_parts.append(token)
-
-    return doc_type, items
 
 
 def handle_start(chat_id: int):
@@ -335,83 +289,63 @@ def handle_text(chat_id: int, text: str):
     text_lower = text.lower()
 
     # Команда?
-    if text.startswith('/'):
+    if text.startswith("/"):
         handle_command(chat_id, text)
         return
 
+    # Быстрая смена типа документа текстом
+    if text_lower in {"производство", "списание", "приход"}:
+        new_doc_type = {
+            "производство": "production",
+            "списание": "writeoff",
+            "приход": "income",
+        }[text_lower]
+        st["doc_type"] = new_doc_type
+        st["items"] = []
+        st["pending_confirm"] = False
+
+        label = DOC_TYPE_LABELS.get(new_doc_type, new_doc_type)
+        send_message(
+            chat_id,
+            f"Режим: {label}.\n"
+            "Вводи позиции в формате «Название Количество».\n"
+            "Когда закончишь — напиши «отправить», я сам поставлю номер и дату."
+        )
+        return
+
     # Явный запрос на отправку текущего списка
-    if text_lower == 'отправить':
+    if text_lower == "отправить":
         auto_send_act(chat_id)
         return
 
-    # Если ждём подтверждение после OCR/массового ввода/голоса
-    if st['pending_confirm']:
+    # Если ждём подтверждение после OCR
+    if st["pending_confirm"]:
         if is_yes(text):
             auto_send_act(chat_id)
             return
 
+        # Иначе — это инструкция для правки
         try:
-            new_items = correct_items_with_instruction(st['items'], text)
+            new_items = correct_items_with_instruction(st["items"], text)
         except Exception as e:
             send_message(chat_id, f"Не смог применить правку через GPT: {e}")
             return
 
-        aligned_items, corrections = align_items_with_catalog(
-            new_items, doc_type=st['doc_type']
-        )
-        st['items'] = aligned_items
-        if not aligned_items:
+        st["items"] = new_items
+        if not new_items:
             send_message(chat_id, "После правки список пуст. Можешь прислать новую фотку или ввести позиции заново.")
-            st['pending_confirm'] = False
+            st["pending_confirm"] = False
             return
 
-        label = DOC_TYPE_LABELS.get(st['doc_type'], st['doc_type'])
-        msg_parts = [
-            f"Тип документа: {label}\n",
-            "Обновлённый список позиций:\n",
-            format_items(aligned_items),
-        ]
-        if corrections:
-            msg_parts.append("\nПоправил названия:\n" + "\n".join(corrections))
-        msg_parts.append("\n\nВсе верно?")
-
-        send_message(chat_id, "".join(msg_parts))
-        return
-
-    # Попытка разобрать сразу несколько позиций (например, из голосового)
-    doc_type_from_text, parsed_items = parse_doc_type_and_items(text)
-    if doc_type_from_text:
-        st['doc_type'] = doc_type_from_text
-        st['items'] = []
-        st['pending_confirm'] = False
-
-    if doc_type_from_text and not parsed_items and text_lower in DOC_TYPE_BY_WORD:
-        label = DOC_TYPE_LABELS.get(st['doc_type'], st['doc_type'])
+        label = DOC_TYPE_LABELS.get(st["doc_type"], st["doc_type"])
         send_message(
             chat_id,
-            f"Режим: {label}\n",
-            "Вводи позиции в формате «Название Количество».\n",
-            "Когда закончишь — напиши «отправить», я сам поставлю номер и дату.",
+            f"Тип документа: {label}\n"
+            "Обновлённый список позиций:\n"
+            + format_items(new_items)
+            + "\n\nВсе верно?"
         )
-        return
-
-    if parsed_items:
-        aligned_items, corrections = align_items_with_catalog(
-            parsed_items, doc_type=st['doc_type']
-        )
-        st['items'] = aligned_items
-        st['pending_confirm'] = True
-
-        label = DOC_TYPE_LABELS.get(st['doc_type'], st['doc_type'])
-        msg_parts = [
-            f"Тип документа: {label}\n",
-            "Нашёл такие позиции:\n",
-            format_items(aligned_items),
-        ]
-        if corrections:
-            msg_parts.append("\nПоправил названия:\n" + "\n".join(corrections))
-        msg_parts.append("\n\nВсе верно?")
-        send_message(chat_id, "".join(msg_parts))
+        # остаёмся в pending_confirm
         return
 
     # Обычный режим: ручной ввод «Название Количество»
@@ -421,21 +355,15 @@ def handle_text(chat_id: int, text: str):
         return
 
     try:
-        qty = float(parts[-1].replace(',', '.'))
+        qty = float(parts[-1].replace(",", "."))
     except ValueError:
         send_message(chat_id, "Не смог прочитать количество. Пример: Тесто 5")
         return
 
-    name = ' '.join(parts[:-1]).strip()
-    aligned_item, corrections = align_items_with_catalog(
-        [{'name': name, 'qty': qty}], doc_type=st['doc_type']
-    )
-    st['items'].extend(aligned_item)
+    name = " ".join(parts[:-1])
+    st["items"].append({"name": name, "qty": qty})
 
-    msg = f"Добавил: {aligned_item[0]['name']} — {aligned_item[0]['qty']}"
-    if corrections:
-        msg += "\nПоправил название: " + '; '.join(corrections)
-    send_message(chat_id, msg)
+    send_message(chat_id, f"Добавил: {name} — {qty}")
 
 
 def handle_photo(chat_id: int, photos: List[Dict]):
@@ -485,75 +413,18 @@ def handle_photo(chat_id: int, photos: List[Dict]):
         send_message(chat_id, "Не нашёл ни одной строки с количеством на фото 😔")
         return
 
-    aligned_items, corrections = align_items_with_catalog(
-        items, doc_type=doc_type
-    )
-
-    st["items"] = aligned_items
+    st["items"] = items
     st["doc_type"] = doc_type
     st["pending_confirm"] = True
 
     label = DOC_TYPE_LABELS.get(doc_type, doc_type)
-    msg_parts = [
-        f"Тип документа: {label}\n",
-        "Нашёл такие позиции:\n",
-        format_items(aligned_items),
-    ]
-    if corrections:
-        msg_parts.append("\nПоправил названия:\n" + "\n".join(corrections))
-    msg_parts.append("\n\nВсе верно?")
-    send_message(chat_id, "".join(msg_parts))
-
-
-def handle_voice(chat_id: int, voice: Dict):
-    """Обрабатываем голосовое: скачиваем, транскрибируем, отправляем в handle_text."""
-    st = get_state(chat_id)
-
-    if not voice:
-        return
-
-    file_id = voice.get("file_id")
-    if not file_id:
-        return
-
-    file_info = api_get("getFile", {"file_id": file_id})
-    if not file_info.get("ok"):
-        send_message(chat_id, f"Не удалось получить голосовое: {file_info}")
-        return
-
-    file_path = file_info["result"].get("file_path")
-    if not file_path:
-        send_message(chat_id, "Не удалось определить путь к голосовому сообщению")
-        return
-
-    file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
-    resp = requests.get(file_url, timeout=60)
-    if resp.status_code != 200:
-        send_message(chat_id, f"Ошибка загрузки голосового: HTTP {resp.status_code}")
-        return
-
-    tmp_dir = Path("tmp_audio")
-    tmp_dir.mkdir(exist_ok=True)
-    local_path = tmp_dir / f"{chat_id}_{file_id}.ogg"
-    with open(local_path, "wb") as f:
-        f.write(resp.content)
-
-    send_message(chat_id, "Слушаю голосовое и распознаю текст...")
-
-    try:
-        transcript = transcribe_voice(str(local_path))
-    except Exception as e:
-        send_message(chat_id, f"Не удалось распознать голосовое: {e}")
-        return
-
-    send_message(chat_id, f"Я понял так:\n{transcript}")
-
-    if st.get("pending_confirm") and any(
-        transcript.lower().startswith(word) for word in DOC_TYPE_BY_WORD
-    ):
-        st["pending_confirm"] = False
-
-    handle_text(chat_id, transcript)
+    send_message(
+        chat_id,
+        f"Тип документа: {label}\n"
+        "Нашёл такие позиции:\n"
+        + format_items(items)
+        + "\n\nВсе верно?"
+    )
 
 
 def process_update(update: dict):
@@ -569,11 +440,6 @@ def process_update(update: dict):
     # Фото
     if "photo" in msg:
         handle_photo(chat_id, msg["photo"])
-        return
-
-    # Голосовые
-    if "voice" in msg:
-        handle_voice(chat_id, msg["voice"])
         return
 
     # Текст
