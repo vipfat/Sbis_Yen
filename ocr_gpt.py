@@ -9,7 +9,6 @@ from typing import List, Dict
 from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image
-from catalog_lookup import resolve_purchase_name
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -177,6 +176,12 @@ def extract_doc_from_image_gpt(image_path: str) -> Dict:
 
     def _filter_catalog(items: List[Dict]) -> List[Dict]:
         """Фильтруем позиции по Каталогу, чтобы отсеять шум."""
+        try:
+            from catalog_lookup import resolve_purchase_name
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Каталог не доступен ({exc}), пропускаю фильтрацию")
+            return items
+
         filtered: List[Dict] = []
         for it in items:
             try:
