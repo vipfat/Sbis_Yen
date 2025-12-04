@@ -13,12 +13,7 @@ from daily_act import (
     send_writeoff_act,
     send_income_act,
 )
-from ocr_gpt import (
-    extract_doc_from_image_gpt,
-    correct_items_with_instruction,
-    transcribe_audio_file,
-    parse_items_from_freeform,
-)
+from ocr_gpt import extract_doc_from_image_gpt, correct_items_with_instruction
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -89,9 +84,7 @@ def handle_start(chat_id: int):
         "распознаю позиции, показываю и спрашиваю: «Все верно?». "
         "Если ответишь «да» — отправлю акт нужного типа в СБИС.\n\n"
         "Можно править текстом:\n"
-        "  «тесто не 2, а 3», «измени песто на тесто», «убери крутоны, добавь Крылышки 4».\n"
-        "  Можно накидать сразу несколько: «тесто три капуста пять картофель один ноль два».\n"
-        "  Голосом тоже ок — пришли voice, я распознаю и применю.\n\n"
+        "  «тесто не 2, а 3», «измени песто на тесто», «убери крутоны, добавь Крылышки 4».\n\n"
         "Команды:\n"
         "  /list — показать текущий список\n"
         "  /clear — очистить список\n"
@@ -355,22 +348,22 @@ def handle_text(chat_id: int, text: str):
         # остаёмся в pending_confirm
         return
 
-    # Обычный режим: ручной ввод, можно несколько позиций подряд
-    new_items = parse_items_from_freeform(text)
-    if not new_items:
-        send_message(
-            chat_id,
-            "Не понял строку. Напиши позиции в формате «Название Количество» "
-            "или перечисли подряд (можно словами). Пример: «Тесто три капуста пять».",
-        )
+    # Обычный режим: ручной ввод «Название Количество»
+    parts = text.split()
+    if len(parts) < 2:
+        send_message(chat_id, "Формат: НАЗВАНИЕ КОЛИЧЕСТВО\nНапример: Тесто 5")
         return
 
-    st["items"].extend(new_items)
-    added_lines = "\n".join(f"- {it['name']} — {it['qty']}" for it in new_items)
-    send_message(
-        chat_id,
-        "Добавил позиции:\n" + added_lines + "\n\nТекущий список:\n" + format_items(st["items"]),
-    )
+    try:
+        qty = float(parts[-1].replace(",", "."))
+    except ValueError:
+        send_message(chat_id, "Не смог прочитать количество. Пример: Тесто 5")
+        return
+
+    name = " ".join(parts[:-1])
+    st["items"].append({"name": name, "qty": qty})
+
+    send_message(chat_id, f"Добавил: {name} — {qty}")
 
 
 def handle_photo(chat_id: int, photos: List[Dict]):
@@ -434,51 +427,6 @@ def handle_photo(chat_id: int, photos: List[Dict]):
     )
 
 
-def handle_voice(chat_id: int, voice: Dict):
-    """Скачиваем voice, отправляем в Whisper и дальше обрабатываем как текст."""
-    file_id = voice.get("file_id")
-    if not file_id:
-        return
-
-    file_info = api_get("getFile", {"file_id": file_id})
-    if not file_info.get("ok"):
-        send_message(chat_id, f"Не удалось получить файл голосового: {file_info}")
-        return
-
-    file_path = file_info["result"].get("file_path")
-    if not file_path:
-        send_message(chat_id, "Не смог прочитать путь к голосовому файлу.")
-        return
-
-    file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
-    resp = requests.get(file_url, timeout=120)
-    if resp.status_code != 200:
-        send_message(chat_id, f"Ошибка загрузки голосового: HTTP {resp.status_code}")
-        return
-
-    tmp_dir = Path("tmp_audio")
-    tmp_dir.mkdir(exist_ok=True)
-    suffix = Path(file_path).suffix or ".oga"
-    local_path = tmp_dir / f"{chat_id}_{file_id}{suffix}"
-    with open(local_path, "wb") as f:
-        f.write(resp.content)
-
-    send_message(chat_id, "Распознаю голосовое сообщение...")
-
-    try:
-        text = transcribe_audio_file(str(local_path))
-    except Exception as e:
-        send_message(chat_id, f"Не смог распознать голос: {e}")
-        return
-
-    if not text:
-        send_message(chat_id, "Не получилось распознать текст в голосовом сообщении.")
-        return
-
-    send_message(chat_id, f"Распознал: {text}")
-    handle_text(chat_id, text)
-
-
 def process_update(update: dict):
     if "message" not in update:
         return
@@ -492,11 +440,6 @@ def process_update(update: dict):
     # Фото
     if "photo" in msg:
         handle_photo(chat_id, msg["photo"])
-        return
-
-    # Голосовое
-    if "voice" in msg:
-        handle_voice(chat_id, msg["voice"])
         return
 
     # Текст
