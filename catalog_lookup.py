@@ -4,6 +4,8 @@ from typing import Dict
 
 import pandas as pd
 
+from name_matching import find_best_match
+
 # Путь к Каталогу
 CATALOG_PATH = Path("Каталог.xlsx")
 
@@ -56,23 +58,13 @@ def resolve_purchase_name(name: str) -> str:
     if not name_clean:
         raise ValueError("Пустое название товара.")
 
-    # 1. Точное совпадение
-    m = DF_CAT["Наименование"] == name_clean
-    if m.any():
-        return DF_CAT.loc[m, "Наименование"].iloc[0]
+    candidate, score = find_best_match(name_clean, DF_CAT["Наименование"].astype(str).tolist())
+    if candidate and score >= 0.55:
+        return candidate
 
-    # 2. Без учёта регистра
-    lower = name_clean.casefold()
-    m = DF_CAT["Наименование"].astype(str).str.casefold() == lower
-    if m.any():
-        return DF_CAT.loc[m, "Наименование"].iloc[0]
-
-    # 3. Содержит (когда в Каталоге, например, 'ЛАЙМ КУХНЯ', а пришло 'лайм')
-    contains = DF_CAT["Наименование"].astype(str).str.casefold().str.contains(lower)
-    if contains.any():
-        return DF_CAT.loc[contains, "Наименование"].iloc[0]
-
-    raise ValueError(f"Товар '{name_clean}' не найден в Каталог.xlsx")
+    raise ValueError(
+        "Товар '{name}' не найден в Каталог.xlsx".format(name=name_clean)
+    )
 
 
 def get_purchase_item(name: str) -> Dict:

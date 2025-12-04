@@ -1,5 +1,6 @@
 # bot_simple.py
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +14,11 @@ from daily_act import (
     send_writeoff_act,
     send_income_act,
 )
-from ocr_gpt import extract_doc_from_image_gpt, correct_items_with_instruction
+from ocr_gpt import (
+    correct_items_with_instruction,
+    extract_doc_from_image_gpt,
+    transcribe_audio,
+)
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -55,11 +60,66 @@ def send_message(chat_id: int, text: str):
     })
 
 
+def transcribe_voice_from_telegram(file_id: str) -> str:
+    file_info = api_get("getFile", {"file_id": file_id})
+    if not file_info.get("ok"):
+        raise RuntimeError(f"Не удалось получить файл голосового: {file_info}")
+
+    file_path = file_info["result"].get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram не вернул путь к файлу голосового.")
+
+    file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+
+    resp = requests.get(file_url, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Ошибка загрузки голосового: HTTP {resp.status_code}")
+
+    tmp_dir = Path("tmp_images")
+    tmp_dir.mkdir(exist_ok=True)
+
+    suffix = Path(file_path).suffix or ".ogg"
+    local_path = tmp_dir / f"voice_{file_id}{suffix}"
+    with open(local_path, "wb") as f:
+        f.write(resp.content)
+
+    return transcribe_audio(str(local_path))
+
+
 def format_items(items: List[Dict]) -> str:
     if not items:
         return "Список пуст."
     lines = [f"{i+1}. {it['name']} — {it['qty']}" for i, it in enumerate(items)]
     return "\n".join(lines)
+
+
+def parse_items_from_text(text: str):
+    """Достаём из строки позиции вида "Название Количество", перечисленные через запятую/перенос."""
+
+    chunks = [c.strip() for c in re.split(r"[,\n;]+", text) if c.strip()]
+    items = []
+    errors = []
+
+    for chunk in chunks:
+        parts = chunk.split()
+        if len(parts) < 2:
+            errors.append(chunk)
+            continue
+
+        try:
+            qty = float(parts[-1].replace(",", "."))
+        except ValueError:
+            errors.append(chunk)
+            continue
+
+        name = " ".join(parts[:-1]).strip()
+        if not name:
+            errors.append(chunk)
+            continue
+
+        items.append({"name": name, "qty": qty})
+
+    return items, errors
 
 
 DOC_TYPE_LABELS = {
@@ -83,8 +143,9 @@ def handle_start(chat_id: int):
         "  кидаешь фото таблицы с количествами — я определяю тип документа, "
         "распознаю позиции, показываю и спрашиваю: «Все верно?». "
         "Если ответишь «да» — отправлю акт нужного типа в СБИС.\n\n"
-        "Можно править текстом:\n"
-        "  «тесто не 2, а 3», «измени песто на тесто», «убери крутоны, добавь Крылышки 4».\n\n"
+        "Можно править текстом или голосом:\n"
+        "  «тесто не 2, а 3», «измени песто на тесто», «убери крутоны, добавь Крылышки 4».\n"
+        "  Голосовое тоже распознаю и применю как правку.\n\n"
         "Команды:\n"
         "  /list — показать текущий список\n"
         "  /clear — очистить список\n"
@@ -283,6 +344,27 @@ def is_yes(text: str) -> bool:
     }
 
 
+def handle_voice(chat_id: int, voice: Dict):
+    file_id = voice.get("file_id")
+    if not file_id:
+        return
+
+    send_message(chat_id, "Распознаю голосовое...")
+
+    try:
+        text = transcribe_voice_from_telegram(file_id)
+    except Exception as e:
+        send_message(chat_id, f"Не смог распознать голосовое: {e}")
+        return
+
+    if not text:
+        send_message(chat_id, "В голосовом не разобрал текст.")
+        return
+
+    send_message(chat_id, f"Распознал голосовое:\n{text}")
+    handle_text(chat_id, text)
+
+
 def handle_text(chat_id: int, text: str):
     st = get_state(chat_id)
     text = text.strip()
@@ -308,7 +390,7 @@ def handle_text(chat_id: int, text: str):
         send_message(
             chat_id,
             f"Режим: {label}.\n"
-            "Вводи позиции в формате «Название Количество».\n"
+            "Вводи позиции в формате «Название Количество» — текстом или голосом.\n"
             "Когда закончишь — напиши «отправить», я сам поставлю номер и дату."
         )
         return
@@ -349,21 +431,23 @@ def handle_text(chat_id: int, text: str):
         return
 
     # Обычный режим: ручной ввод «Название Количество»
-    parts = text.split()
-    if len(parts) < 2:
-        send_message(chat_id, "Формат: НАЗВАНИЕ КОЛИЧЕСТВО\nНапример: Тесто 5")
+    items, errors = parse_items_from_text(text)
+    if not items:
+        send_message(
+            chat_id,
+            "Не смог прочитать позиции. Формат: НАЗВАНИЕ КОЛИЧЕСТВО\n"
+            "Можно перечислять через запятую: «капуста 2, картофель 3».",
+        )
         return
 
-    try:
-        qty = float(parts[-1].replace(",", "."))
-    except ValueError:
-        send_message(chat_id, "Не смог прочитать количество. Пример: Тесто 5")
-        return
+    st["items"].extend(items)
 
-    name = " ".join(parts[:-1])
-    st["items"].append({"name": name, "qty": qty})
+    added_lines = [f"- {it['name']} — {it['qty']}" for it in items]
+    msg = "Добавил:\n" + "\n".join(added_lines)
+    if errors:
+        msg += "\n\nНе разобрал строки:\n" + "\n".join(f"- {e}" for e in errors)
 
-    send_message(chat_id, f"Добавил: {name} — {qty}")
+    send_message(chat_id, msg)
 
 
 def handle_photo(chat_id: int, photos: List[Dict]):
@@ -435,6 +519,11 @@ def process_update(update: dict):
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
     if chat_id is None:
+        return
+
+    # Голосовые
+    if "voice" in msg:
+        handle_voice(chat_id, msg["voice"])
         return
 
     # Фото

@@ -8,8 +8,9 @@ import xml.etree.ElementTree as ET
 import requests
 
 from sbis_auth import get_auth_headers
-from compositions import build_components_for_output
-from catalog_lookup import get_purchase_item
+from compositions import DF_COMP, DF_PROD, build_components_for_output
+from catalog_lookup import DF_CAT, get_purchase_item
+from name_matching import find_best_match
 
 
 SBIS_URL = "https://online.sbis.ru/service/?srv=1"
@@ -68,6 +69,27 @@ DOC_KINDS = {
 }
 
 
+def _pick_best_known_names(user_input: str) -> Dict:
+    """Ищем самое подходящее название во всех справочниках."""
+
+    sources = {
+        "composition": DF_COMP["Родитель"].astype(str).tolist(),
+        "production": DF_PROD["Наименование"].astype(str).tolist(),
+        "catalog": DF_CAT["Наименование"].astype(str).tolist(),
+    }
+
+    best_overall = {"score": 0.0, "name": None, "source": None}
+    per_source: Dict[str, Dict] = {}
+
+    for source, names in sources.items():
+        candidate, score = find_best_match(user_input, names)
+        if candidate:
+            per_source[source] = {"name": candidate, "score": score}
+            if score > best_overall["score"]:
+                best_overall = {"score": score, "name": candidate, "source": source}
+
+    return {"overall": best_overall, "by_source": per_source}
+
 
 def build_native_xml(doc_kind: str,
                      doc_date: str,
@@ -103,6 +125,10 @@ def build_native_xml(doc_kind: str,
             # пустое название – выбрасываем
             continue
 
+        best_match = _pick_best_known_names(name_input)
+        best_by_source = best_match.get("by_source", {})
+        best_overall = best_match.get("overall", {})
+
         # Сырые данные по количеству
         raw_qty = item.get("qty", "")
 
@@ -129,7 +155,9 @@ def build_native_xml(doc_kind: str,
 
         if doc_kind == "income":
             # ПРИХОД: берём товар из Каталога, без составов
-            meta = get_purchase_item(name_input)
+            catalog_candidate = best_by_source.get("catalog")
+            target_name = catalog_candidate["name"] if catalog_candidate and catalog_candidate.get("name") else name_input
+            meta = get_purchase_item(target_name)
             row_attrs = {
                 "Вместимость": "0",
                 "ЕдИзм": meta["unit"],
@@ -149,9 +177,12 @@ def build_native_xml(doc_kind: str,
             # 1) пробуем реестр составов (полуфабрикаты)
             # 2) если нет — используем Каталог как обычный товар
 
+            composition_candidate = best_by_source.get("composition") or best_by_source.get("production")
+            recipe_name = composition_candidate["name"] if composition_candidate else name_input
+
             try:
                 # Попытка взять техкарту
-                recipe = build_components_for_output(name_input, output_qty=qty)
+                recipe = build_components_for_output(recipe_name, output_qty=qty)
 
                 parent_name = recipe["parent_name"]
                 parent_code = recipe["parent_code"]
@@ -195,7 +226,9 @@ def build_native_xml(doc_kind: str,
                 # Нет в реестре составов — считаем обычным товаром из Каталога
                 print(f"[WARN] '{name_input}' нет в реестре составов → иду в Каталог. Причина: {e}")
 
-                meta = get_purchase_item(name_input)
+                catalog_candidate = best_by_source.get("catalog") or best_overall
+                target_name = catalog_candidate.get("name") if catalog_candidate and catalog_candidate.get("name") else name_input
+                meta = get_purchase_item(target_name)
 
                 row_attrs = {
                     "Вместимость": "0",
