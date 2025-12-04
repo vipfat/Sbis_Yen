@@ -3,19 +3,10 @@ import base64
 import os
 import json
 import re
-import importlib.util
-from io import BytesIO
 from typing import List, Dict
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from catalog_lookup import resolve_purchase_name
-
-_pillow_spec = importlib.util.find_spec("PIL")
-if _pillow_spec:
-    from PIL import Image
-else:
-    Image = None  # type: ignore[assignment]
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -25,49 +16,11 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Более свежая модель для плотных таблиц
-VISION_MODEL = "gpt-4o"
-
 
 def encode_image(image_path: str) -> str:
     """Преобразуем картинку в base64 для передачи в GPT."""
     with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
-
-
-def encode_image_bytes(image: "Image.Image") -> str:
-    """Конвертирует PIL-изображение в base64 (JPEG)."""
-    if Image is None:
-        raise RuntimeError("Для разбивки изображения нужен Pillow. Установи пакет Pillow.")
-
-    buffer = BytesIO()
-    image.save(buffer, format="JPEG", quality=95)
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-
-def split_image_into_tiles(
-    image: "Image.Image", tile_size: int = 1400, overlap: int = 100
-) -> List["Image.Image"]:
-    """
-    Делит изображение на перекрывающиеся тайлы, чтобы не терять строки
-    на больших таблицах. Если картинка и так небольшая, вернёт её одну.
-    """
-    if Image is None:
-        return [image]
-    width, height = image.size
-    if width <= tile_size and height <= tile_size:
-        return [image]
-
-    step = tile_size - overlap
-    tiles: List[Image.Image] = []
-
-    for top in range(0, height, step):
-        for left in range(0, width, step):
-            right = min(left + tile_size, width)
-            bottom = min(top + tile_size, height)
-            tiles.append(image.crop((left, top, right, bottom)))
-
-    return tiles
 
 
 def _parse_json_strict_or_relaxed(text: str):
@@ -100,8 +53,9 @@ def extract_doc_from_image_gpt(image_path: str) -> Dict:
       "items": [ {"name": "...", "qty": float}, ... ]
     }
     """
-    def _request_vision(b64_image: str) -> Dict:
-        prompt = """
+    b64 = encode_image(image_path)
+
+    prompt = """
 Ты — система распознавания таблиц для кафе.
 
 На фото находится лист с таблицей и заголовком. В заголовке листа (или рядом с таблицей)
@@ -140,36 +94,43 @@ def extract_doc_from_image_gpt(image_path: str) -> Dict:
 Никакого лишнего текста кроме JSON.
 """
 
-        response = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64_image}"
-                            },
+    response = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}"
                         },
-                    ],
-                }
-            ],
-            max_tokens=700,
-            temperature=0,
-        )
+                    },
+                ],
+            }
+        ],
+        max_tokens=700,
+        temperature=0,
+    )
 
-        text = response.choices[0].message.content or ""
-        raw_resp = _parse_json_strict_or_relaxed(text)
+    text = response.choices[0].message.content or ""
+    raw = _parse_json_strict_or_relaxed(text)
 
-        if not isinstance(raw_resp, dict):
-            raise RuntimeError(f"Ожидался JSON-объект, а пришло:\n{text}")
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Ожидался JSON-объект, а пришло:\n{text}")
 
-        return raw_resp
+    doc_type = raw.get("doc_type", "").strip()
+    items_raw = raw.get("items", [])
 
-    def _normalize_items(items_raw: List[Dict]) -> List[Dict]:
-        items: List[Dict] = []
+    # Нормализуем doc_type
+    if doc_type not in ("production", "writeoff", "income"):
+        # если GPT тупанул — по умолчанию считаем производством
+        doc_type = "production"
+
+    # Нормализуем список позиций
+    items: List[Dict] = []
+    if isinstance(items_raw, list):
         for it in items_raw:
             if not isinstance(it, dict):
                 continue
@@ -184,51 +145,10 @@ def extract_doc_from_image_gpt(image_path: str) -> Dict:
             if qty_val == 0:
                 continue
             items.append({"name": name, "qty": qty_val})
-        return items
-
-    def _filter_catalog(items: List[Dict]) -> List[Dict]:
-        """Фильтруем позиции по Каталогу, чтобы отсеять шум."""
-        filtered: List[Dict] = []
-        for it in items:
-            try:
-                canonical = resolve_purchase_name(it["name"])
-            except Exception:  # noqa: BLE001
-                continue
-            filtered.append({"name": canonical, "qty": it["qty"]})
-        return filtered
-
-    if Image is None:
-        # Фолбэк: Pillow недоступен, шлём цельное изображение, как раньше
-        raw_responses: List[Dict] = [_request_vision(encode_image(image_path))]
-    else:
-        image = Image.open(image_path).convert("RGB")
-        tiles = split_image_into_tiles(image)
-
-        raw_responses = []
-        for tile in tiles:
-            b64_tile = encode_image_bytes(tile)
-            raw_responses.append(_request_vision(b64_tile))
-
-    doc_type_candidates = [
-        str(r.get("doc_type", "")).strip() for r in raw_responses if isinstance(r, dict)
-    ]
-    items_raw: List[Dict] = []
-    for r in raw_responses:
-        tile_items = r.get("items", []) if isinstance(r, dict) else []
-        if isinstance(tile_items, list):
-            items_raw.extend(tile_items)
-
-    doc_type = next(
-        (dt for dt in doc_type_candidates if dt in ("production", "writeoff", "income")),
-        "production",
-    )
-
-    items = _normalize_items(items_raw)
-    filtered_items = _filter_catalog(items)
 
     return {
         "doc_type": doc_type,
-        "items": filtered_items,
+        "items": items,
     }
 
 
