@@ -45,6 +45,18 @@ def _parse_json_strict_or_relaxed(text: str):
     return json.loads(m.group(0))
 
 
+def transcribe_audio_file(audio_path: str) -> str:
+    """Преобразует аудио/голосовое сообщение в текст через Whisper."""
+    with open(audio_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            language="ru",
+            response_format="text",
+        )
+    return (result or "").strip()
+
+
 def extract_doc_from_image_gpt(image_path: str) -> Dict:
     """
     Отправляет фото таблицы в GPT и возвращает структуру:
@@ -220,3 +232,80 @@ def correct_items_with_instruction(items: List[Dict], instruction: str) -> List[
         norm_items.append({"name": name, "qty": qty_val})
 
     return norm_items
+
+
+def parse_items_from_freeform(text: str) -> List[Dict]:
+    """
+    Пытается выделить пары «название — количество» из произвольного текста
+    (включая голосовое, распознанное в текст). Поддерживает перечисление
+    нескольких позиций подряд и запись количества словами.
+    """
+
+    def try_simple_parse(line: str) -> List[Dict]:
+        pairs: List[Dict] = []
+        chunks = re.split(r"[\n;,]+", line)
+        for chunk in chunks:
+            part = chunk.strip()
+            if not part:
+                continue
+            tokens = part.split()
+            if len(tokens) < 2:
+                continue
+            try:
+                qty_val = float(tokens[-1].replace(",", "."))
+            except ValueError:
+                continue
+            name_val = " ".join(tokens[:-1]).strip()
+            if not name_val:
+                continue
+            pairs.append({"name": name_val, "qty": qty_val})
+        return pairs
+
+    # Сначала пробуем выделить явные пары «слово ... число» без GPT
+    simple_items = try_simple_parse(text)
+    if simple_items:
+        return simple_items
+
+    prompt = (
+        "Ты помогаешь составлять список позиций (название + количество).\n"
+        "Пользователь может написать или продиктовать сразу несколько строк подряд,\n"
+        "в том числе без запятых и переносов. Количество может быть числом или\n"
+        "написано словами. Нужно вернуть JSON-массив объектов вида \"name\" + \"qty\"."\n
+        "Правила:\n"
+        "- Вытяни все пары (название, количество), даже если они перечислены подряд.\n"
+        "- Преобразуй числительные словами в число. Пример: \"три\" → 3, \"один ноль два\" → 1.02.\n"
+        "- Если текста про позиции нет — верни пустой массив [].\n"
+        "- Никаких пояснений, только JSON-массив.\n\n"
+        f"Текст пользователя:\n{text}\n"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=500,
+        temperature=0,
+    )
+
+    ai_text = response.choices[0].message.content or ""
+    raw_items = _parse_json_strict_or_relaxed(ai_text)
+
+    if not isinstance(raw_items, list):
+        return []
+
+    items: List[Dict] = []
+    for it in raw_items:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name", "")).strip()
+        qty = it.get("qty")
+        if not name:
+            continue
+        try:
+            qty_val = float(qty)
+        except (TypeError, ValueError):
+            continue
+        if qty_val == 0:
+            continue
+        items.append({"name": name, "qty": qty_val})
+
+    return items
