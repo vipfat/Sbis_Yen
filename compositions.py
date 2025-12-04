@@ -4,6 +4,8 @@ from typing import Dict, List
 
 import pandas as pd
 
+from name_matching import find_best_match
+
 # Пути к файлам
 COMP_PATH = Path("Реестр составов.xlsx")
 PROD_PATH = Path("Производство.xlsx")
@@ -63,16 +65,9 @@ def resolve_parent_name(name: str) -> str:
     """
     name_clean = name.strip()
 
-    # Прямое совпадение
-    mask = DF_COMP["Родитель"] == name_clean
-    if mask.any():
-        return DF_COMP.loc[mask, "Родитель"].iloc[0]
-
-    # Без учёта регистра
-    lower = name_clean.lower()
-    mask = DF_COMP["Родитель"].str.lower() == lower
-    if mask.any():
-        return DF_COMP.loc[mask, "Родитель"].iloc[0]
+    candidate, score = find_best_match(name_clean, DF_COMP["Родитель"].astype(str).tolist())
+    if candidate and score >= 0.55:
+        return candidate
 
     raise ValueError(f"Родитель '{name_clean}' не найден в Реестре составов.")
 

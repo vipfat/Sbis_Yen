@@ -17,6 +17,26 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
+def transcribe_audio(file_path: str) -> str:
+    """Преобразуем аудио-файл (голосовое) в текст через Whisper."""
+
+    with open(file_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            language="ru",
+        )
+
+    text = getattr(result, "text", None)
+    if isinstance(result, dict):
+        text = text or result.get("text")
+
+    if not text:
+        raise RuntimeError("Не удалось распознать речь в голосовом сообщении.")
+
+    return text.strip()
+
+
 def encode_image(image_path: str) -> str:
     """Преобразуем картинку в base64 для передачи в GPT."""
     with open(image_path, "rb") as f:
