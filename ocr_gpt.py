@@ -3,13 +3,10 @@ import base64
 import os
 import json
 import re
-from collections import Counter
-from io import BytesIO
-from typing import List, Dict, Iterable
+from typing import List, Dict
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from PIL import Image
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -20,11 +17,10 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-def encode_image_pil(image: Image.Image) -> str:
-    """Преобразуем PIL-изображение в base64 (JPEG) для передачи в GPT."""
-    buffer = BytesIO()
-    image.save(buffer, format="JPEG", quality=95)
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+def encode_image(image_path: str) -> str:
+    """Преобразуем картинку в base64 для передачи в GPT."""
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
 
 def _parse_json_strict_or_relaxed(text: str):
@@ -49,80 +45,6 @@ def _parse_json_strict_or_relaxed(text: str):
     return json.loads(m.group(0))
 
 
-def _split_image_to_blocks(image_path: str, target_height: int = 1200, overlap: int = 80) -> List[Image.Image]:
-    """
-    Делим изображение на вертикальные блоки с перекрытием, чтобы улучшить OCR.
-
-    target_height — целевая высота блока; overlap — перекрытие блоков (px),
-    чтобы строки на границе не потерялись.
-    """
-    img = Image.open(image_path).convert("RGB")
-    width, height = img.size
-
-    blocks: List[Image.Image] = []
-    y = 0
-    while y < height:
-        y_end = min(y + target_height, height)
-        y0 = max(0, y - overlap // 2)
-        y1 = min(height, y_end + overlap // 2)
-        blocks.append(img.crop((0, y0, width, y1)))
-        y = y_end
-
-    return blocks
-
-
-def _merge_items(block_items: Iterable[Dict]) -> List[Dict]:
-    """
-    Объединяем позиции из разных блоков, избегая дублирования.
-
-    Дубликаты определяются по названию (без регистра). Если количества отличаются,
-    берём значение с большим модулем, чтобы сохранить финальную цифру из табличной строки.
-    """
-    merged = {}
-    for item in block_items:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name", "")).strip()
-        qty = item.get("qty")
-        if not name:
-            continue
-        try:
-            qty_val = float(qty)
-        except (TypeError, ValueError):
-            continue
-
-        key = name.lower()
-        if key in merged:
-            existing_qty = merged[key]["qty"]
-            if abs(qty_val) > abs(existing_qty):
-                merged[key] = {"name": name, "qty": qty_val}
-        else:
-            merged[key] = {"name": name, "qty": qty_val}
-
-    return list(merged.values())
-
-
-def _normalize_items(items_raw) -> List[Dict]:
-    """Приводим сырой ответ GPT по одному фрагменту к стабильному списку."""
-    items: List[Dict] = []
-    if isinstance(items_raw, list):
-        for it in items_raw:
-            if not isinstance(it, dict):
-                continue
-            name = str(it.get("name", "")).strip()
-            qty = it.get("qty")
-            if not name:
-                continue
-            try:
-                qty_val = float(qty)
-            except (TypeError, ValueError):
-                continue
-            if qty_val == 0:
-                continue
-            items.append({"name": name, "qty": qty_val})
-    return items
-
-
 def extract_doc_from_image_gpt(image_path: str) -> Dict:
     """
     Отправляет фото таблицы в GPT и возвращает структуру:
@@ -131,38 +53,32 @@ def extract_doc_from_image_gpt(image_path: str) -> Dict:
       "items": [ {"name": "...", "qty": float}, ... ]
     }
     """
-    blocks = _split_image_to_blocks(image_path)
-    total_blocks = len(blocks)
+    b64 = encode_image(image_path)
 
-    base_prompt = """
+    prompt = """
 Ты — система распознавания таблиц для кафе.
 
-Работаешь по шагам: изображение заранее поделено на несколько вертикальных фрагментов.
-На каждом фрагменте может быть только часть таблицы. Тебе нужно аккуратно разобрать
-ТОЛЬКО тот фрагмент, который сейчас отправлен, чтобы потом объединить результаты без дублирования.
-
-На листе есть таблица и заголовок. В заголовке (или рядом с таблицей) будет одно из слов:
+На фото находится лист с таблицей и заголовком. В заголовке листа (или рядом с таблицей)
+будет написано ОДНО из слов:
 
 - "Производство"
 - "Списание"
 - "Приход"
 
-Твоя задача по каждому фрагменту:
+Твоя задача:
 
-1) Определить тип документа по заголовку, если он виден на фрагменте, и вернуть одно из значений:
+1) Определить тип документа по заголовку и вернуть одно из значений:
    - "production"  — если в заголовке написано "Производство"
    - "writeoff"    — если в заголовке написано "Списание"
    - "income"      — если в заголовке написано "Приход"
-   Если заголовка не видно на текущем фрагменте — сделай осторожное предположение по контексту.
 
-2) Извлечь строки таблицы с полуфабрикатами ТОЛЬКО из этого фрагмента:
-   - читай таблицу по строкам слева направо, не перескакивай между колонками;
+2) Извлечь строки таблицы с полуфабрикатами:
+   - читаем ТАБЛИЦУ ПО СТРОКАМ слева направо, не перескакивая между колонками;
    - первая колонка: название полуфабриката (например: "Тесто", "Крутоны");
    - в последних колонках — итоговое количество для этой же строки (рукописное или печатное);
-   - бери только строки, где количество явно указано (не пусто, не прочерк);
+   - берём ТОЛЬКО строки, где количество явно указано (не пусто, не прочерк);
    - если несколько чисел в строке, выбирай конечное значение количества (обычно самый правый столбец);
-   - не перемешивай данные между строками: название и количество принадлежат одной строке;
-   - не выдумывай и не дублируй строки, которых нет на фрагменте.
+   - не перемешивай данные между строками: название и количество должны принадлежать одной строке.
 
 Перед ответом мысленно проверь каждую строку: совпадают ли название и количество в одной строке,
 не перепутаны ли соседние значения. Нужна максимальная точность без ручных правок.
@@ -184,61 +100,57 @@ def extract_doc_from_image_gpt(image_path: str) -> Dict:
 Никакого лишнего текста кроме JSON.
 """
 
-    doc_type_votes: Counter = Counter()
-    collected_items: List[Dict] = []
-
-    for idx, block in enumerate(blocks, start=1):
-        block_prompt = (
-            base_prompt
-            + "\n\nРаботаешь с фрагментом {idx}/{total}.".format(
-                idx=idx, total=total_blocks
-            )
-            + " Учти, что соседние фрагменты обрабатываются отдельно, поэтому"
-            " не добавляй лишние строки и не дублируй то, чего нет на изображении."
-        )
-
-        b64 = encode_image_pil(block)
-        response = client.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": block_prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64}"
-                            },
+    response = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}"
                         },
-                    ],
-                }
-            ],
-            max_tokens=700,
-            temperature=0,
-        )
+                    },
+                ],
+            }
+        ],
+        max_tokens=700,
+        temperature=0,
+    )
 
-        text = response.choices[0].message.content or ""
-        raw = _parse_json_strict_or_relaxed(text)
+    text = response.choices[0].message.content or ""
+    raw = _parse_json_strict_or_relaxed(text)
 
-        if not isinstance(raw, dict):
-            raise RuntimeError(
-                f"Ожидался JSON-объект для блока {idx}, а пришло:\n{text}"
-            )
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Ожидался JSON-объект, а пришло:\n{text}")
 
-        doc_type = raw.get("doc_type", "").strip()
-        items_raw = raw.get("items", [])
+    doc_type = raw.get("doc_type", "").strip()
+    items_raw = raw.get("items", [])
 
-        if doc_type not in ("production", "writeoff", "income"):
-            doc_type = "production"
+    # Нормализуем doc_type
+    if doc_type not in ("production", "writeoff", "income"):
+        # если GPT тупанул — по умолчанию считаем производством
+        doc_type = "production"
 
-        doc_type_votes[doc_type] += 1
-        collected_items.extend(_normalize_items(items_raw))
-
-    final_doc_type = doc_type_votes.most_common(1)
-    doc_type = final_doc_type[0][0] if final_doc_type else "production"
-
-    items = _merge_items(collected_items)
+    # Нормализуем список позиций
+    items: List[Dict] = []
+    if isinstance(items_raw, list):
+        for it in items_raw:
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("name", "")).strip()
+            qty = it.get("qty")
+            if not name:
+                continue
+            try:
+                qty_val = float(qty)
+            except (TypeError, ValueError):
+                continue
+            if qty_val == 0:
+                continue
+            items.append({"name": name, "qty": qty_val})
 
     return {
         "doc_type": doc_type,
