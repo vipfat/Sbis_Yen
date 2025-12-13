@@ -253,13 +253,23 @@ def build_native_xml(doc_kind: str,
     ET.SubElement(sender, "СвФЛ", ORG_FL)
     ET.SubElement(sender, "Склад", {
         "Идентификатор": "284",
-        "Название": "ЯР Самолёт",
+        "Название": "ИП Плетнев",
     })
 
     receiver = ET.SubElement(doc, "Получатель")
     ET.SubElement(receiver, "Склад", {
-        "Название": "ЯР Самолёт",
+        "Название": "ИП Плетнев",
     })
+    
+    # === Для акта списания добавляем причину (ТаблСклад) ===
+    if doc_kind == "writeoff":
+        tabl_sklad = ET.SubElement(doc, "ТаблСклад")
+        ET.SubElement(tabl_sklad, "СтрТабл", {
+            "Назначение": "Списание на производственные расходы",
+            "Получатель": "Фирлесс, ООО",
+            "Склад": "ИП Плетнев",
+            "Счет": "20-01",
+        })
 
     xml_bytes = ET.tostring(
         root,
