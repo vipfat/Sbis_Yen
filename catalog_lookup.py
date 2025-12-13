@@ -10,14 +10,29 @@ from name_matching import find_best_match
 
 class ProductNotFoundError(Exception):
     """Исключение когда товар не найден, с вариантами для выбора."""
-    def __init__(self, query: str, suggestions: List[Tuple[str, float]]):
+    def __init__(self, query: str, suggestions: List[Tuple[str, float]], item_index: int = 0):
         self.query = query
         self.suggestions = suggestions  # [(name, score), ...]
+        self.item_index = item_index  # Индекс товара в списке
         
         msg = f"Товар '{query}' не найден в каталоге (лучший score: {suggestions[0][1]:.3f}).\n"
         msg += "Похожие товары:\n"
         for name, score in suggestions[:3]:
             msg += f"  - {name} (score: {score:.3f})\n"
+        
+        super().__init__(msg)
+
+
+class MultipleProductsNotFoundError(Exception):
+    """Исключение когда несколько товаров не найдены."""
+    def __init__(self, errors: List[ProductNotFoundError]):
+        self.errors = errors  # Список ProductNotFoundError
+        
+        msg = f"Не найдено {len(errors)} товаров в каталоге:\n"
+        for err in errors[:3]:  # Показываем первые 3
+            msg += f"  - {err.query}\n"
+        if len(errors) > 3:
+            msg += f"  ... и ещё {len(errors) - 3}\n"
         
         super().__init__(msg)
 

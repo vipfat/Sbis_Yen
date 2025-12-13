@@ -15,7 +15,7 @@ from daily_act import (
     send_writeoff_act,
     send_income_act,
 )
-from catalog_lookup import ProductNotFoundError
+from catalog_lookup import ProductNotFoundError, MultipleProductsNotFoundError
 from ocr_gpt import (
     correct_items_with_instruction,
     extract_doc_from_image_gpt,
@@ -42,7 +42,8 @@ def get_state(chat_id: int) -> Dict:
     st.setdefault("items", [])
     st.setdefault("pending_confirm", False)
     st.setdefault("doc_type", "production")
-    st.setdefault("pending_product_choice", None)  # {"original": "...", "suggestions": [...], "item_index": N}
+    st.setdefault("pending_product_choice", None)  # Текущий спорный товар
+    st.setdefault("pending_errors_queue", [])  # Очередь остальных спорных товаров
     return st
 
 
@@ -66,7 +67,7 @@ def send_message(chat_id: int, text: str, reply_markup=None):
     api_post("sendMessage", data)
 
 
-def send_product_choice(chat_id: int, original: str, suggestions: List[tuple], item_index: int):
+def send_product_choice(chat_id: int, original: str, suggestions: List[tuple], item_index: int, progress: str = None):
     """
     Отправляет сообщение с inline кнопками для выбора похожего товара.
     
@@ -74,8 +75,11 @@ def send_product_choice(chat_id: int, original: str, suggestions: List[tuple], i
         original: Оригинальное название (не найдено)
         suggestions: Список (name, score)
         item_index: Индекс товара в списке items для замены
+        progress: Прогресс вида "1/3" (опционально)
     """
     text = f"❌ Товар '{original}' не найден в каталоге.\n\n"
+    if progress:
+        text = f"[{progress}] " + text
     text += "Выберите подходящий вариант:"
     
     # Создаем inline кнопки
@@ -304,31 +308,54 @@ def send_act_by_type(chat_id: int,
         else:
             # fallback — как производство
             result = send_daily_act(doc_date, doc_number, valid_items)
-    except ProductNotFoundError as e:
-        # Товар не найден - предлагаем выбор
+    except MultipleProductsNotFoundError as e:
+        # Несколько товаров не найдены - обрабатываем по очереди
         st = get_state(chat_id)
         
-        # Находим индекс товара в списке items
-        item_index = None
-        for idx, item in enumerate(st["items"]):
-            if item.get("name", "").strip().lower() == e.query.lower():
-                item_index = idx
-                break
+        errors = e.errors
+        send_message(chat_id, f"⚠️ Найдено {len(errors)} спорных товаров. Разберём по порядку...")
         
-        if item_index is None:
-            item_index = 0  # Fallback
+        # Первую ошибку показываем сразу
+        first_error = errors[0]
         
-        # Сохраняем контекст выбора
+        # Остальные в очередь
+        st["pending_errors_queue"] = errors[1:]
+        
+        # Сохраняем контекст выбора первого товара
+        st["pending_product_choice"] = {
+            "original": first_error.query,
+            "suggestions": first_error.suggestions,
+            "item_index": first_error.item_index,
+            "doc_date": doc_date,
+            "doc_number": doc_number,
+            "total_errors": len(errors),
+            "current_error_num": 1,
+        }
+        
+        # Отправляем кнопки выбора для первого товара
+        send_product_choice(
+            chat_id, 
+            first_error.query, 
+            first_error.suggestions, 
+            first_error.item_index,
+            progress=f"1/{len(errors)}"
+        )
+        return
+    except ProductNotFoundError as e:
+        # Один товар не найден (старый путь, на всякий случай)
+        st = get_state(chat_id)
+        
         st["pending_product_choice"] = {
             "original": e.query,
             "suggestions": e.suggestions,
-            "item_index": item_index,
+            "item_index": e.item_index,
             "doc_date": doc_date,
             "doc_number": doc_number,
+            "total_errors": 1,
+            "current_error_num": 1,
         }
         
-        # Отправляем кнопки выбора
-        send_product_choice(chat_id, e.query, e.suggestions, item_index)
+        send_product_choice(chat_id, e.query, e.suggestions, e.item_index, progress="1/1")
         return
     except Exception as e:
         send_message(chat_id, f"Ошибка при формировании/отправке акта: {e}")
@@ -615,9 +642,35 @@ def handle_callback_query(callback_query: dict):
         if 0 <= item_index < len(st["items"]):
             removed_item = st["items"].pop(item_index)
             send_message(chat_id, f"❌ Товар '{removed_item['name']}' пропущен.")
+        
+        # Проверяем, есть ли ещё спорные товары в очереди
+        if st.get("pending_errors_queue"):
+            next_error = st["pending_errors_queue"].pop(0)
+            current_num = choice_ctx.get("current_error_num", 1) + 1
+            total = choice_ctx.get("total_errors", 1)
+            
+            st["pending_product_choice"] = {
+                "original": next_error.query,
+                "suggestions": next_error.suggestions,
+                "item_index": next_error.item_index,
+                "doc_date": choice_ctx["doc_date"],
+                "doc_number": choice_ctx["doc_number"],
+                "total_errors": total,
+                "current_error_num": current_num,
+            }
+            
+            send_product_choice(
+                chat_id,
+                next_error.query,
+                next_error.suggestions,
+                next_error.item_index,
+                progress=f"{current_num}/{total}"
+            )
+            return
+        
+        # Очередь пуста - пробуем отправить акт
         st["pending_product_choice"] = None
         
-        # Пробуем отправить акт снова с оставшимися товарами
         if st["items"]:
             send_message(chat_id, "Пробую отправить акт с оставшимися товарами...")
             send_act_by_type(
@@ -645,10 +698,35 @@ def handle_callback_query(callback_query: dict):
                 f"✅ Заменено:\n'{old_name}' → '{chosen_name}' (score: {score:.2f})"
             )
         
+        # Проверяем, есть ли ещё спорные товары в очереди
+        if st.get("pending_errors_queue"):
+            next_error = st["pending_errors_queue"].pop(0)
+            current_num = choice_ctx.get("current_error_num", 1) + 1
+            total = choice_ctx.get("total_errors", 1)
+            
+            st["pending_product_choice"] = {
+                "original": next_error.query,
+                "suggestions": next_error.suggestions,
+                "item_index": next_error.item_index,
+                "doc_date": choice_ctx["doc_date"],
+                "doc_number": choice_ctx["doc_number"],
+                "total_errors": total,
+                "current_error_num": current_num,
+            }
+            
+            send_product_choice(
+                chat_id,
+                next_error.query,
+                next_error.suggestions,
+                next_error.item_index,
+                progress=f"{current_num}/{total}"
+            )
+            return
+        
+        # Очередь пуста - отправляем акт
         st["pending_product_choice"] = None
         
-        # Пробуем отправить акт снова
-        send_message(chat_id, "Отправляю акт...")
+        send_message(chat_id, "✅ Все товары обработаны! Отправляю акт...")
         send_act_by_type(
             chat_id,
             st["doc_type"],

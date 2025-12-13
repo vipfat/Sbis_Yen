@@ -11,7 +11,7 @@ from config import COMPANY, TIMEOUTS
 from utils import to_float_safe, format_quantity
 from sbis_auth import get_auth_headers
 from compositions import DF_COMP, DF_PROD, build_components_for_output
-from catalog_lookup import DF_CAT, get_purchase_item
+from catalog_lookup import DF_CAT, get_purchase_item, ProductNotFoundError, MultipleProductsNotFoundError
 from name_matching import find_best_match
 
 
@@ -281,6 +281,55 @@ def _add_writeoff_reason(doc_element):
     })
 
 
+def _validate_all_items_resolvable(daily_items: List[Dict], doc_kind: str) -> None:
+    """
+    Предварительная проверка: все ли товары можно найти в каталоге/составах.
+    Если есть проблемы - выбрасывает MultipleProductsNotFoundError со всеми ошибками.
+    """
+    errors = []
+    
+    for idx, item in enumerate(daily_items):
+        name_input = str(item.get("name", "")).strip()
+        if not name_input:
+            continue
+        
+        qty = _parse_item_quantity(item.get("qty", ""))
+        if qty == 0:
+            continue
+        
+        try:
+            # Пробуем найти товар
+            best_match = _pick_best_known_names(name_input)
+            best_by_source = best_match.get("by_source", {})
+            
+            if doc_kind == "income":
+                # Для прихода просто проверяем каталог
+                catalog_candidate = best_by_source.get("catalog")
+                target_name = catalog_candidate["name"] if catalog_candidate and catalog_candidate.get("name") else name_input
+                _ = get_purchase_item(target_name)  # Может выбросить ProductNotFoundError
+            else:
+                # Для производства/списания пробуем состав, потом каталог
+                composition_candidate = best_by_source.get("composition") or best_by_source.get("production")
+                recipe_name = composition_candidate["name"] if composition_candidate else name_input
+                
+                try:
+                    _ = build_components_for_output(recipe_name, output_qty=qty)
+                except Exception:
+                    # Нет в составах - проверяем каталог
+                    catalog_candidate = best_by_source.get("catalog")
+                    target_name = catalog_candidate.get("name") if catalog_candidate and catalog_candidate.get("name") else name_input
+                    _ = get_purchase_item(target_name)  # Может выбросить ProductNotFoundError
+        
+        except ProductNotFoundError as e:
+            # Сохраняем индекс товара для последующей замены
+            e.item_index = idx
+            errors.append(e)
+    
+    # Если есть ошибки - выбрасываем общее исключение
+    if errors:
+        raise MultipleProductsNotFoundError(errors)
+
+
 def build_native_xml(doc_kind: str,
                      doc_date: str,
                      doc_number: str,
@@ -289,7 +338,13 @@ def build_native_xml(doc_kind: str,
     Собираем XML для акта (производство/списание/приход).
     
     Разбит на вспомогательные функции для улучшения читаемости.
+    
+    Raises:
+        MultipleProductsNotFoundError: Если один или несколько товаров не найдены
     """
+    # Предварительная проверка всех товаров
+    _validate_all_items_resolvable(daily_items, doc_kind)
+    
     # Создаем корневую структуру XML
     root, doc = _create_xml_root(doc_kind, doc_date, doc_number)
     tab = ET.SubElement(doc, "ТаблДок")
