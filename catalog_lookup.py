@@ -64,6 +64,23 @@ def resolve_purchase_name(name: str, min_score: float = 0.55) -> str:
     if not name_clean:
         raise ValueError("Пустое название товара.")
 
+    # Специальная обработка для "охотничьи" vs "хот"
+    # OCR и голосовой ввод часто путают эти слова
+    name_lower = name_clean.lower()
+    if "хот" in name_lower and "соус" not in name_lower:
+        # Если есть "хот" но нет "соус" - скорее всего "охотничьи"
+        # Также если просто "хот" без других слов - тоже "охотничьи"
+        if (any(word in name_lower for word in ["колбас", "охот", "кол"]) or 
+            name_lower.strip() in ["хот", "хот."]):
+            # Явно ищем КОЛБАСКИ ОХОТНИЧЬИ
+            for cat_name in DF_CAT["Наименование"].astype(str).tolist():
+                if "КОЛБАСКИ ОХОТНИЧЬИ" in cat_name.upper():
+                    import sys
+                    print(f"[INFO] Специальная обработка: '{name_clean}' → 'КОЛБАСКИ ОХОТНИЧЬИ'", 
+                          file=sys.stderr)
+                    _log_catalog_match(name_clean, cat_name, 1.0)
+                    return cat_name
+
     catalog_names = DF_CAT["Наименование"].astype(str).tolist()
     candidate, score = find_best_match(name_clean, catalog_names)
     
