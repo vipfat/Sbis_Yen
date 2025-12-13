@@ -1,11 +1,25 @@
 # catalog_lookup.py
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import pandas as pd
 
 from config import PATHS
 from utils import to_float_safe
 from name_matching import find_best_match
+
+
+class ProductNotFoundError(Exception):
+    """Исключение когда товар не найден, с вариантами для выбора."""
+    def __init__(self, query: str, suggestions: List[Tuple[str, float]]):
+        self.query = query
+        self.suggestions = suggestions  # [(name, score), ...]
+        
+        msg = f"Товар '{query}' не найден в каталоге (лучший score: {suggestions[0][1]:.3f}).\n"
+        msg += "Похожие товары:\n"
+        for name, score in suggestions[:3]:
+            msg += f"  - {name} (score: {score:.3f})\n"
+        
+        super().__init__(msg)
 
 # Грузим один раз
 DF_RAW = pd.read_excel(PATHS.catalog_excel, sheet_name="Таблица")
@@ -73,18 +87,13 @@ def resolve_purchase_name(name: str, min_score: float = 0.55) -> str:
                   file=sys.stderr)
         return candidate
 
-    # Если не найдено, показываем топ-3 похожих для отладки
+    # Если не найдено, показываем топ-5 похожих для выбора
     from name_matching import calc_similarity
     scores = [(n, calc_similarity(name_clean, n)) for n in catalog_names if n.strip()]
     scores.sort(key=lambda x: x[1], reverse=True)
-    top_matches = scores[:3]
+    top_matches = scores[:5]  # Топ-5 для выбора
     
-    err_msg = f"Товар '{name_clean}' не найден в Каталог.xlsx (лучший score: {score:.3f}).\n"
-    err_msg += "Похожие товары:\n"
-    for match_name, match_score in top_matches:
-        err_msg += f"  - {match_name} (score: {match_score:.3f})\n"
-    
-    raise ValueError(err_msg)
+    raise ProductNotFoundError(name_clean, top_matches)
 
 
 def _log_catalog_match(query: str, result: str, score: float):

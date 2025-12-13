@@ -2,6 +2,7 @@
 import os
 import re
 import time
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -14,6 +15,7 @@ from daily_act import (
     send_writeoff_act,
     send_income_act,
 )
+from catalog_lookup import ProductNotFoundError
 from ocr_gpt import (
     correct_items_with_instruction,
     extract_doc_from_image_gpt,
@@ -40,6 +42,7 @@ def get_state(chat_id: int) -> Dict:
     st.setdefault("items", [])
     st.setdefault("pending_confirm", False)
     st.setdefault("doc_type", "production")
+    st.setdefault("pending_product_choice", None)  # {"original": "...", "suggestions": [...], "item_index": N}
     return st
 
 
@@ -53,11 +56,47 @@ def api_post(method: str, data: dict):
     return resp.json()
 
 
-def send_message(chat_id: int, text: str):
-    api_post("sendMessage", {
+def send_message(chat_id: int, text: str, reply_markup=None):
+    data = {
         "chat_id": chat_id,
         "text": text,
-    })
+    }
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    api_post("sendMessage", data)
+
+
+def send_product_choice(chat_id: int, original: str, suggestions: List[tuple], item_index: int):
+    """
+    Отправляет сообщение с inline кнопками для выбора похожего товара.
+    
+    Args:
+        original: Оригинальное название (не найдено)
+        suggestions: Список (name, score)
+        item_index: Индекс товара в списке items для замены
+    """
+    text = f"❌ Товар '{original}' не найден в каталоге.\n\n"
+    text += "Выберите подходящий вариант:"
+    
+    # Создаем inline кнопки
+    buttons = []
+    for idx, (name, score) in enumerate(suggestions[:5], 1):  # Топ-5
+        callback_data = json.dumps({
+            "action": "replace_product",
+            "item_index": item_index,
+            "new_name": name
+        })
+        # Telegram callback_data ограничен 64 байтами, используем короткий формат
+        callback_short = f"prod:{item_index}:{idx-1}"
+        
+        button_text = f"{idx}. {name} ({score:.2f})"
+        buttons.append([{"text": button_text, "callback_data": callback_short}])
+    
+    # Кнопка "Пропустить"
+    buttons.append([{"text": "❌ Пропустить этот товар", "callback_data": f"prod:{item_index}:skip"}])
+    
+    reply_markup = {"inline_keyboard": buttons}
+    send_message(chat_id, text, reply_markup)
 
 
 def transcribe_voice_from_telegram(file_id: str) -> str:
@@ -265,6 +304,32 @@ def send_act_by_type(chat_id: int,
         else:
             # fallback — как производство
             result = send_daily_act(doc_date, doc_number, valid_items)
+    except ProductNotFoundError as e:
+        # Товар не найден - предлагаем выбор
+        st = get_state(chat_id)
+        
+        # Находим индекс товара в списке items
+        item_index = None
+        for idx, item in enumerate(st["items"]):
+            if item.get("name", "").strip().lower() == e.query.lower():
+                item_index = idx
+                break
+        
+        if item_index is None:
+            item_index = 0  # Fallback
+        
+        # Сохраняем контекст выбора
+        st["pending_product_choice"] = {
+            "original": e.query,
+            "suggestions": e.suggestions,
+            "item_index": item_index,
+            "doc_date": doc_date,
+            "doc_number": doc_number,
+        }
+        
+        # Отправляем кнопки выбора
+        send_product_choice(chat_id, e.query, e.suggestions, item_index)
+        return
     except Exception as e:
         send_message(chat_id, f"Ошибка при формировании/отправке акта: {e}")
         return
@@ -511,7 +576,94 @@ def handle_photo(chat_id: int, photos: List[Dict]):
     )
 
 
+def handle_callback_query(callback_query: dict):
+    """Обработка нажатий на inline кнопки."""
+    query_id = callback_query.get("id")
+    data = callback_query.get("data", "")
+    from_user = callback_query.get("from") or {}
+    chat_id = from_user.get("id")
+    message = callback_query.get("message") or {}
+    
+    if not chat_id:
+        return
+    
+    # Подтверждаем получение callback
+    api_post("answerCallbackQuery", {"callback_query_id": query_id})
+    
+    # Парсим callback_data: "prod:item_index:choice_index" или "prod:item_index:skip"
+    if not data.startswith("prod:"):
+        return
+    
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    
+    _, item_index_str, choice = parts
+    item_index = int(item_index_str)
+    
+    st = get_state(chat_id)
+    choice_ctx = st.get("pending_product_choice")
+    
+    if not choice_ctx:
+        send_message(chat_id, "⚠️ Контекст выбора потерян. Попробуй заново.")
+        return
+    
+    suggestions = choice_ctx["suggestions"]
+    
+    if choice == "skip":
+        # Пропускаем товар - удаляем из списка
+        if 0 <= item_index < len(st["items"]):
+            removed_item = st["items"].pop(item_index)
+            send_message(chat_id, f"❌ Товар '{removed_item['name']}' пропущен.")
+        st["pending_product_choice"] = None
+        
+        # Пробуем отправить акт снова с оставшимися товарами
+        if st["items"]:
+            send_message(chat_id, "Пробую отправить акт с оставшимися товарами...")
+            send_act_by_type(
+                chat_id,
+                st["doc_type"],
+                choice_ctx["doc_date"],
+                choice_ctx["doc_number"],
+                st["items"]
+            )
+        else:
+            send_message(chat_id, "Список товаров пуст. Добавь товары заново.")
+        return
+    
+    # Выбран конкретный вариант
+    choice_idx = int(choice)
+    if 0 <= choice_idx < len(suggestions):
+        chosen_name, score = suggestions[choice_idx]
+        
+        # Заменяем название в списке
+        if 0 <= item_index < len(st["items"]):
+            old_name = st["items"][item_index]["name"]
+            st["items"][item_index]["name"] = chosen_name
+            send_message(
+                chat_id,
+                f"✅ Заменено:\n'{old_name}' → '{chosen_name}' (score: {score:.2f})"
+            )
+        
+        st["pending_product_choice"] = None
+        
+        # Пробуем отправить акт снова
+        send_message(chat_id, "Отправляю акт...")
+        send_act_by_type(
+            chat_id,
+            st["doc_type"],
+            choice_ctx["doc_date"],
+            choice_ctx["doc_number"],
+            st["items"]
+        )
+
+
 def process_update(update: dict):
+    # Обработка callback от inline кнопок
+    if "callback_query" in update:
+        handle_callback_query(update["callback_query"])
+        return
+    
     if "message" not in update:
         return
 
