@@ -253,12 +253,12 @@ def build_native_xml(doc_kind: str,
     ET.SubElement(sender, "СвФЛ", ORG_FL)
     ET.SubElement(sender, "Склад", {
         "Идентификатор": "284",
-        "Название": "ИП Плетнев",
+        "Название": "ЯР Самолёт",
     })
 
     receiver = ET.SubElement(doc, "Получатель")
     ET.SubElement(receiver, "Склад", {
-        "Название": "ИП Плетнев",
+        "Название": "ЯР Самолёт",
     })
 
     xml_bytes = ET.tostring(
