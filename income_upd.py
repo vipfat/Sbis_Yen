@@ -6,6 +6,7 @@ from typing import List, Dict
 import xml.etree.ElementTree as ET
 import requests
 
+from utils import to_float_safe, format_money, format_quantity
 from sbis_auth import get_auth_headers
 from catalog_lookup import get_purchase_item
 
@@ -13,42 +14,6 @@ SBIS_URL = "https://online.sbis.ru/service/?srv=1"
 
 # Путь к эталонному входящему УПД (тот XML, что ты загрузил)
 TEMPLATE_UPD_PATH = "ON_NSCHFDOPPR__940200200247_20251116_3EFE5FF7-D5B2-421B-9362-66BF0089799A_0_0_0_0_0_00.xml"
-
-
-def _fmt_qty(x: float) -> str:
-    s = f"{float(x):.3f}"
-    s = s.rstrip("0").rstrip(".")
-    return s if s else "0"
-
-
-def _to_float_safe(val, default: float = 0.0) -> float:
-    """
-    Аккуратно приводим к float:
-    - режем пробелы
-    - меняем запятую на точку
-    - пустое => default
-    - мусор => предупреждение и default
-    """
-    if isinstance(val, (int, float)):
-        return float(val)
-
-    s = str(val).strip().replace(",", ".")
-    if not s:
-        return float(default)
-
-    try:
-        return float(s)
-    except ValueError:
-        print(f"[WARN] Не могу привести к float: {val!r}, беру {default}")
-        return float(default)
-
-
-def _fmt_money(x) -> str:
-    """
-    Деньги в формате 0.00, с точкой. x может быть строкой или числом.
-    """
-    value = _to_float_safe(x, default=0.0)
-    return f"{value:.2f}".replace(",", ".")
 
 
 def _extract_seller_inn(root) -> str:
@@ -147,7 +112,7 @@ def build_income_upd_xml(doc_date: str, doc_number: str, daily_items: List[Dict]
 
         # >>> ТУТ БЫЛА ПРОБЛЕМА <<<
         raw_price = meta.get("price", 0.0)
-        price = _to_float_safe(raw_price, default=0.0)
+        price = to_float_safe(raw_price, default=0.0)
 
         line_sum = qty * price
 
@@ -156,16 +121,16 @@ def build_income_upd_xml(doc_date: str, doc_number: str, daily_items: List[Dict]
 
         new_row = deepcopy(row_template)
 
-        new_row.set("КолТов", _fmt_qty(qty))
+        new_row.set("КолТов", format_quantity(qty))
         new_row.set("НаимТов", full_name)
         new_row.set("НаимЕдИзм", unit)
         if okee:
             new_row.set("ОКЕИ_Тов", okee)
 
         new_row.set("НомСтр", str(idx))
-        new_row.set("ЦенаТов", _fmt_money(price))
-        new_row.set("СтТовБезНДС", _fmt_money(line_sum))
-        new_row.set("СтТовУчНал", _fmt_money(line_sum))
+        new_row.set("ЦенаТов", format_money(price))
+        new_row.set("СтТовБезНДС", format_money(line_sum))
+        new_row.set("СтТовУчНал", format_money(line_sum))
 
         dop = new_row.find("ДопСведТов")
         if dop is None:
@@ -184,9 +149,9 @@ def build_income_upd_xml(doc_date: str, doc_number: str, daily_items: List[Dict]
 
     totals = tbl.find("ВсегоОпл")
     if totals is not None:
-        totals.set("КолНеттоВс", _fmt_qty(total_qty))
-        totals.set("СтТовБезНДСВсего", _fmt_money(total_sum))
-        totals.set("СтТовУчНалВсего", _fmt_money(total_sum))
+        totals.set("КолНеттоВс", format_quantity(total_qty))
+        totals.set("СтТовБезНДСВсего", format_money(total_sum))
+        totals.set("СтТовУчНалВсего", format_money(total_sum))
 
     xml_bytes = ET.tostring(
         root,

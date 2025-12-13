@@ -1,16 +1,14 @@
 # catalog_lookup.py
-from pathlib import Path
 from typing import Dict
 
 import pandas as pd
 
+from config import PATHS
+from utils import to_float_safe
 from name_matching import find_best_match
 
-# Путь к Каталогу
-CATALOG_PATH = Path("Каталог.xlsx")
-
 # Грузим один раз
-DF_RAW = pd.read_excel(CATALOG_PATH, sheet_name="Таблица")
+DF_RAW = pd.read_excel(PATHS.catalog_excel, sheet_name="Таблица")
 
 # Чистим строки без единиц измерения (типа "ИП ПЛЕТНЁВ", "Фишер" и т.п.)
 DF_CAT = DF_RAW.copy()
@@ -24,26 +22,6 @@ OKEI_BY_UNIT = {
     "л": "112",
     "шт": "796",
 }
-
-
-def safe_price(value, default: float = 0.0) -> float:
-    """
-    Любая дичь в цене (пусто, пробелы, '—', 'н/д' и т.п.) -> default (0.0).
-    Нормальные числа/строки с запятой тоже понимает.
-    """
-    # Уже число
-    if isinstance(value, (int, float)):
-        return float(value)
-
-    s = str(value).strip().replace(",", ".")
-    if not s:
-        return float(default)
-
-    try:
-        return float(s)
-    except ValueError:
-        print(f"[WARN] Мусор в цене: {value!r}, подставляю {default}")
-        return float(default)
 
 
 def resolve_purchase_name(name: str, min_score: float = 0.55) -> str:
@@ -148,7 +126,7 @@ def get_purchase_item(name: str) -> Dict:
 
     # Берём цену из колонки "Себест." и безопасно приводим к float
     raw_price = row["Себест."]
-    purchase_price = safe_price(raw_price, default=0.0)
+    purchase_price = to_float_safe(raw_price, default=0.0)
 
     return {
         "name": canonical,

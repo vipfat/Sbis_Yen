@@ -4,15 +4,13 @@ from typing import Dict, List
 
 import pandas as pd
 
+from config import PATHS
+from utils import to_float_safe
 from name_matching import find_best_match
 
-# Пути к файлам
-COMP_PATH = Path("Реестр составов.xlsx")
-PROD_PATH = Path("Производство.xlsx")
-
 # Грузим один раз
-DF_COMP = pd.read_excel(COMP_PATH)
-DF_PROD = pd.read_excel(PROD_PATH, sheet_name="Таблица")
+DF_COMP = pd.read_excel(PATHS.compositions_excel)
+DF_PROD = pd.read_excel(PATHS.production_excel, sheet_name="Таблица")
 
 # ОКЕИ по единицам измерения
 OKEI_BY_UNIT = {
@@ -22,40 +20,6 @@ OKEI_BY_UNIT = {
     "шт": "796",
     # добавишь по мере надобности: "мл", "упак" и т.п.
 }
-
-
-def _to_float_safe(value):
-    """
-    Аккуратно переводим что-нибудь в float:
-    - пустые строки, пробелы, None, NaN → None
-    - '12,34' → 12.34
-    - всё, что не парсится → None
-    """
-    import math
-
-    if value is None:
-        return None
-
-    # Если уже число
-    if isinstance(value, (int, float)):
-        try:
-            if math.isnan(value):
-                return None
-        except TypeError:
-            pass
-        return float(value)
-
-    # Если строка
-    if isinstance(value, str):
-        s = value.strip().replace(",", ".")
-        if not s:
-            return None
-        try:
-            return float(s)
-        except ValueError:
-            return None
-
-    return None
 
 
 def resolve_parent_name(name: str) -> str:
@@ -134,8 +98,8 @@ def get_parent_meta(parent_code: str) -> Dict:
         "name": row["Наименование"],
         "unit": unit,
         "okeei": OKEI_BY_UNIT.get(unit, ""),
-        "price": _to_float_safe(row.get("Цена")),
-        "cost": _to_float_safe(row.get("Себест.")),
+        "price": to_float_safe(row.get("Цена")),
+        "cost": to_float_safe(row.get("Себест.")),
     }
 
 

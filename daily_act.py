@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 import requests
 
 from config import COMPANY, TIMEOUTS
+from utils import to_float_safe, format_quantity
 from sbis_auth import get_auth_headers
 from compositions import DF_COMP, DF_PROD, build_components_for_output
 from catalog_lookup import DF_CAT, get_purchase_item
@@ -122,163 +123,139 @@ def _pick_best_known_names(user_input: str) -> Dict:
     return {"overall": best_overall, "by_source": per_source}
 
 
-def build_native_xml(doc_kind: str,
-                     doc_date: str,
-                     doc_number: str,
-                     daily_items: List[Dict]) -> bytes:
-    """
-    Собираем XML, который кладем во вложение.
-
-    Для production/writeoff – это native 3.01.
-    Для income – используем ту же простую структуру, но с другим "Формат".
-    """
+def _create_xml_root(doc_kind: str, doc_date: str, doc_number: str) -> tuple:
+    """Создает корневой элемент XML и документ."""
     kind = DOC_KINDS.get(doc_kind)
     if not kind:
         raise ValueError(f"Неизвестный тип документа: {doc_kind}")
-
+    
     root = ET.Element("Файл", {
         "ВерсияФормата": kind.get("version", "3.01"),
         "Формат": kind["file_format"],
     })
-
+    
     doc = ET.SubElement(root, "Документ", {
         "Дата": doc_date,
         "Номер": doc_number,
     })
+    
+    return root, doc
 
-    tab = ET.SubElement(doc, "ТаблДок")
 
-    line_index = 1
-    for item in daily_items:
-        # Название строки
-        name_input = str(item.get("name", "")).strip()
-        if not name_input:
-            # пустое название – выбрасываем
-            continue
+def _parse_item_quantity(raw_qty) -> float:
+    """
+    Безопасно извлекает количество из сырых данных.
+    
+    Returns:
+        float: Количество или 0.0 если не удалось распарсить
+    """
+    if isinstance(raw_qty, (int, float)):
+        return float(raw_qty)
+    
+    raw_str = str(raw_qty).strip()
+    if not raw_str:
+        return 0.0
+    
+    return to_float_safe(raw_str, default=0.0)
 
-        best_match = _pick_best_known_names(name_input)
-        best_by_source = best_match.get("by_source", {})
-        best_overall = best_match.get("overall", {})
 
-        # Сырые данные по количеству
-        raw_qty = item.get("qty", "")
+def _build_income_row(item_name: str, qty: float, line_index: int, best_by_source: Dict) -> Dict:
+    """Строит атрибуты строки для акта прихода."""
+    catalog_candidate = best_by_source.get("catalog")
+    target_name = catalog_candidate["name"] if catalog_candidate and catalog_candidate.get("name") else item_name
+    meta = get_purchase_item(target_name)
+    
+    return {
+        "Вместимость": "0",
+        "ЕдИзм": meta["unit"],
+        "ЗаказатьКодов": "0",
+        "Идентификатор": meta["code"],
+        "Кол_во": format_quantity(qty),
+        "Название": meta["name"],
+        "ОКЕИ": meta["okeei"],
+        "ПорНомер": str(line_index),
+        "Сумма": "0.00",
+        "Цена": "0.00",
+    }
 
-        # 1) если уже число – просто приводим к float
-        if isinstance(raw_qty, (int, float)):
-            qty = float(raw_qty)
-        else:
-            # 2) строка – чистим пробелы и пытаемся распарсить
-            raw_str = str(raw_qty).strip()
-            if not raw_str:
-                # было "", " ", "\t" и т.п. – пропускаем
-                continue
-            try:
-                qty = float(raw_str.replace(",", "."))
-            except ValueError:
-                # вообще мусор (например "шт", "ок", "—") – пропускаем,
-                # но можно заодно лог вывести
-                print(f"[WARN] Пропускаю строку '{name_input}', не могу понять количество: {raw_str!r}")
-                continue
 
-        # 3) нулевые количества нам в акте не нужны
-        if qty == 0:
-            continue
+def _build_production_row_with_recipe(item_name: str, qty: float, line_index: int, 
+                                      best_by_source: Dict, tab_element) -> int:
+    """
+    Строит строку производства/списания с рецептом (составом).
+    
+    Returns:
+        int: Количество добавленных строк (1 + компоненты)
+    """
+    composition_candidate = best_by_source.get("composition") or best_by_source.get("production")
+    recipe_name = composition_candidate["name"] if composition_candidate else item_name
+    
+    recipe = build_components_for_output(recipe_name, output_qty=qty)
+    
+    parent_name = recipe["parent_name"]
+    parent_code = recipe["parent_code"]
+    unit = recipe["parent_unit"]
+    okee = recipe["parent_okeei"]
+    
+    # Строка родителя
+    row_attrs = {
+        "Вместимость": "0",
+        "ЕдИзм": unit,
+        "ЗаказатьКодов": "0",
+        "Идентификатор": parent_code,
+        "Кол_во": format_quantity(qty),
+        "Название": parent_name,
+        "ОКЕИ": okee,
+        "ПорНомер": str(line_index),
+        "Сумма": "0.00",
+        "Цена": "0.00",
+    }
+    row = ET.SubElement(tab_element, "СтрТабл", row_attrs)
+    
+    # Состав
+    comp_index = 1
+    for comp in recipe["components"]:
+        comp_attrs = {
+            "Вместимость": "0",
+            "ЕдИзм": comp["unit"],
+            "Идентификатор": comp["code"],
+            "Кол_во": f"{comp['qty']:.6f}",
+            "Кол_во_План": f"{comp['qty']:.6f}",
+            "Название": comp["name"],
+            "ОКЕИ": comp["okeei"],
+            "ПорНомер": str(comp_index),
+            "Сумма": "0.00",
+            "Цена": "0.00",
+        }
+        ET.SubElement(row, "СоставСтрТабл", comp_attrs)
+        comp_index += 1
+    
+    return 1
 
-        if doc_kind == "income":
-            # ПРИХОД: берём товар из Каталога, без составов
-            catalog_candidate = best_by_source.get("catalog")
-            target_name = catalog_candidate["name"] if catalog_candidate and catalog_candidate.get("name") else name_input
-            meta = get_purchase_item(target_name)
-            row_attrs = {
-                "Вместимость": "0",
-                "ЕдИзм": meta["unit"],
-                "ЗаказатьКодов": "0",
-                "Идентификатор": meta["code"],
-                "Кол_во": f"{qty:.3f}",
-                "Название": meta["name"],
-                "ОКЕИ": meta["okeei"],
-                "ПорНомер": str(line_index),
-                "Сумма": "0.00",
-                "Цена": "0.00",
-            }
-            ET.SubElement(tab, "СтрТабл", row_attrs)
 
-        else:
-            # ПРОИЗВОДСТВО / СПИСАНИЕ:
-            # 1) пробуем реестр составов (полуфабрикаты)
-            # 2) если нет — используем Каталог как обычный товар
+def _build_catalog_row(item_name: str, qty: float, line_index: int, best_by_source: Dict) -> Dict:
+    """Строит атрибуты строки для обычного товара из каталога."""
+    catalog_candidate = best_by_source.get("catalog")
+    target_name = catalog_candidate.get("name") if catalog_candidate and catalog_candidate.get("name") else item_name
+    meta = get_purchase_item(target_name)
+    
+    return {
+        "Вместимость": "0",
+        "ЕдИзм": meta["unit"],
+        "ЗаказатьКодов": "0",
+        "Идентификатор": meta["code"],
+        "Кол_во": format_quantity(qty),
+        "Название": meta["name"],
+        "ОКЕИ": meta["okeei"],
+        "ПорНомер": str(line_index),
+        "Сумма": "0.00",
+        "Цена": "0.00",
+    }
 
-            composition_candidate = best_by_source.get("composition") or best_by_source.get("production")
-            recipe_name = composition_candidate["name"] if composition_candidate else name_input
 
-            try:
-                # Попытка взять техкарту
-                recipe = build_components_for_output(recipe_name, output_qty=qty)
-
-                parent_name = recipe["parent_name"]
-                parent_code = recipe["parent_code"]
-                unit = recipe["parent_unit"]
-                okee = recipe["parent_okeei"]
-
-                # Строка родителя
-                row_attrs = {
-                    "Вместимость": "0",
-                    "ЕдИзм": unit,
-                    "ЗаказатьКодов": "0",
-                    "Идентификатор": parent_code,
-                    "Кол_во": f"{qty:.3f}",
-                    "Название": parent_name,
-                    "ОКЕИ": okee,
-                    "ПорНомер": str(line_index),
-                    "Сумма": "0.00",
-                    "Цена": "0.00",
-                }
-                row = ET.SubElement(tab, "СтрТабл", row_attrs)
-
-                # Состав
-                comp_index = 1
-                for comp in recipe["components"]:
-                    comp_attrs = {
-                        "Вместимость": "0",
-                        "ЕдИзм": comp["unit"],
-                        "Идентификатор": comp["code"],
-                        "Кол_во": f"{comp['qty']:.6f}",
-                        "Кол_во_План": f"{comp['qty']:.6f}",
-                        "Название": comp["name"],
-                        "ОКЕИ": comp["okeei"],
-                        "ПорНомер": str(comp_index),
-                        "Сумма": "0.00",
-                        "Цена": "0.00",
-                    }
-                    ET.SubElement(row, "СоставСтрТабл", comp_attrs)
-                    comp_index += 1
-
-            except Exception as e:
-                # Нет в реестре составов — считаем обычным товаром из Каталога
-                print(f"[WARN] '{name_input}' нет в реестре составов → иду в Каталог. Причина: {e}")
-
-                catalog_candidate = best_by_source.get("catalog") or best_overall
-                target_name = catalog_candidate.get("name") if catalog_candidate and catalog_candidate.get("name") else name_input
-                meta = get_purchase_item(target_name)
-
-                row_attrs = {
-                    "Вместимость": "0",
-                    "ЕдИзм": meta["unit"],
-                    "ЗаказатьКодов": "0",
-                    "Идентификатор": meta["code"],
-                    "Кол_во": f"{qty:.3f}",
-                    "Название": meta["name"],
-                    "ОКЕИ": meta["okeei"],
-                    "ПорНомер": str(line_index),
-                    "Сумма": "0.00",
-                    "Цена": "0.00",
-                }
-                ET.SubElement(tab, "СтрТабл", row_attrs)
-
-        line_index += 1
-
-    # === Отправитель / Получатель ===
-    sender = ET.SubElement(doc, "Отправитель", {
+def _add_sender_receiver(doc_element):
+    """Добавляет секции Отправитель и Получатель в документ."""
+    sender = ET.SubElement(doc_element, "Отправитель", {
         "Название": SENDER_TITLE,
     })
     ET.SubElement(sender, "СвФЛ", ORG_FL)
@@ -286,27 +263,83 @@ def build_native_xml(doc_kind: str,
         "Идентификатор": COMPANY.warehouse_id,
         "Название": COMPANY.warehouse_name,
     })
-
-    receiver = ET.SubElement(doc, "Получатель")
+    
+    receiver = ET.SubElement(doc_element, "Получатель")
     ET.SubElement(receiver, "Склад", {
         "Название": COMPANY.warehouse_name,
     })
-    
-    # === Для акта списания добавляем причину (ТаблСклад) ===
-    if doc_kind == "writeoff":
-        tabl_sklad = ET.SubElement(doc, "ТаблСклад")
-        ET.SubElement(tabl_sklad, "СтрТабл", {
-            "Назначение": COMPANY.writeoff_purpose,
-            "Получатель": COMPANY.recipient_name,
-            "Склад": COMPANY.warehouse_name,
-            "Счет": COMPANY.account,
-        })
 
-    xml_bytes = ET.tostring(
-        root,
-        encoding="windows-1251",
-        xml_declaration=True,
-    )
+
+def _add_writeoff_reason(doc_element):
+    """Добавляет причину списания (ТаблСклад) для актов списания."""
+    tabl_sklad = ET.SubElement(doc_element, "ТаблСклад")
+    ET.SubElement(tabl_sklad, "СтрТабл", {
+        "Назначение": COMPANY.writeoff_purpose,
+        "Получатель": COMPANY.recipient_name,
+        "Склад": COMPANY.warehouse_name,
+        "Счет": COMPANY.account,
+    })
+
+
+def build_native_xml(doc_kind: str,
+                     doc_date: str,
+                     doc_number: str,
+                     daily_items: List[Dict]) -> bytes:
+    """
+    Собираем XML для акта (производство/списание/приход).
+    
+    Разбит на вспомогательные функции для улучшения читаемости.
+    """
+    # Создаем корневую структуру XML
+    root, doc = _create_xml_root(doc_kind, doc_date, doc_number)
+    tab = ET.SubElement(doc, "ТаблДок")
+
+    line_index = 1
+    for item in daily_items:
+        # Валидация названия
+        name_input = str(item.get("name", "")).strip()
+        if not name_input:
+            continue
+
+        # Сопоставление с каталогом/составами
+        best_match = _pick_best_known_names(name_input)
+        best_by_source = best_match.get("by_source", {})
+        best_overall = best_match.get("overall", {})
+
+        # Парсинг количества
+        qty = _parse_item_quantity(item.get("qty", ""))
+        if qty == 0:
+            print(f"[WARN] Пропускаю '{name_input}': некорректное или нулевое количество")
+            continue
+
+        # Обработка в зависимости от типа документа
+        if doc_kind == "income":
+            # ПРИХОД: только каталог, без составов
+            row_attrs = _build_income_row(name_input, qty, line_index, best_by_source)
+            ET.SubElement(tab, "СтрТабл", row_attrs)
+            line_index += 1
+
+        else:
+            # ПРОИЗВОДСТВО / СПИСАНИЕ: пробуем состав, затем каталог
+            try:
+                _build_production_row_with_recipe(name_input, qty, line_index, best_by_source, tab)
+                line_index += 1
+            except Exception as e:
+                # Нет в составах - обычный товар из каталога
+                print(f"[WARN] '{name_input}' нет в реестре составов → иду в Каталог. Причина: {e}")
+                row_attrs = _build_catalog_row(name_input, qty, line_index, best_by_source)
+                ET.SubElement(tab, "СтрТабл", row_attrs)
+                line_index += 1
+
+    # Добавляем секции отправителя/получателя
+    _add_sender_receiver(doc)
+    
+    # Для списания добавляем причину
+    if doc_kind == "writeoff":
+        _add_writeoff_reason(doc)
+
+    # Генерация итогового XML
+    xml_bytes = ET.tostring(root, encoding="windows-1251", xml_declaration=True)
     return xml_bytes
 
 
