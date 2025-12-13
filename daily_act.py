@@ -72,6 +72,23 @@ DOC_KINDS = {
 def _pick_best_known_names(user_input: str) -> Dict:
     """Ищем самое подходящее название во всех справочниках."""
 
+    # СПЕЦИАЛЬНАЯ ОБРАБОТКА: "хот" vs "охотничьи"
+    # Если в запросе "хот" без "соус" - это КОЛБАСКИ ОХОТНИЧЬИ, а не СОУС ХОТ
+    user_lower = user_input.lower().strip()
+    if "хот" in user_lower and "соус" not in user_lower:
+        if any(word in user_lower for word in ["колбас", "охот", "кол"]) or user_lower in ["хот", "хот."]:
+            # Принудительно ищем КОЛБАСКИ ОХОТНИЧЬИ во всех справочниках
+            forced_name = "КОЛБАСКИ ОХОТНИЧЬИ"
+            result = {
+                "overall": {"score": 1.0, "name": forced_name, "source": "catalog"},
+                "by_source": {
+                    "catalog": {"name": forced_name, "score": 1.0},
+                }
+            }
+            import sys
+            print(f"[INFO] Принудительное сопоставление: '{user_input}' → '{forced_name}'", file=sys.stderr)
+            return result
+
     sources = {
         "composition": DF_COMP["Родитель"].astype(str).tolist(),
         "production": DF_PROD["Наименование"].astype(str).tolist(),
@@ -87,6 +104,19 @@ def _pick_best_known_names(user_input: str) -> Dict:
             per_source[source] = {"name": candidate, "score": score}
             if score > best_overall["score"]:
                 best_overall = {"score": score, "name": candidate, "source": source}
+    
+    # Для каталога используем resolve_purchase_name с специальной логикой
+    try:
+        from catalog_lookup import resolve_purchase_name
+        catalog_resolved = resolve_purchase_name(user_input, min_score=0.5)
+        # Пересчитываем score для точного соответствия
+        catalog_score = find_best_match(user_input, [catalog_resolved])[1]
+        if catalog_score >= 0.5:
+            per_source["catalog"] = {"name": catalog_resolved, "score": catalog_score}
+            if catalog_score > best_overall["score"]:
+                best_overall = {"score": catalog_score, "name": catalog_resolved, "source": "catalog"}
+    except:
+        pass  # Если не нашли - используем результат find_best_match выше
 
     return {"overall": best_overall, "by_source": per_source}
 
