@@ -1,1 +1,60 @@
+# Environment variables
 .env
+.env.local
+.env.*.local
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+tmp_images/
+*.tmp
+*.bak
+
+# Logs
+logs/
+*.log
+
+# SBIS tokens and sensitive data
+sbis_token.json
+*.token
+
+# Generated XML files
+act_generated.xml
+ON_*.xml
+
+# Excel temporary files
+~$*.xlsx
+~$*.xls
+
+# pytest cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Documentation artifacts
+docs/_build/

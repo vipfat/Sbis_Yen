@@ -7,6 +7,7 @@ from typing import List, Dict
 import xml.etree.ElementTree as ET
 import requests
 
+from config import COMPANY, TIMEOUTS
 from sbis_auth import get_auth_headers
 from compositions import DF_COMP, DF_PROD, build_components_for_output
 from catalog_lookup import DF_CAT, get_purchase_item
@@ -15,10 +16,10 @@ from name_matching import find_best_match
 
 SBIS_URL = "https://online.sbis.ru/service/?srv=1"
 
-# Константы твоей организации (как в рабочем акте)
+# Константы твоей организации (из config)
 SENDER_TITLE = "Плетнёв Виталий Николаевич, ИП, точка продаж"
 ORG_FL = {
-    "ИНН": "940200200247",
+    "ИНН": COMPANY.inn,
     "Имя": "Виталий",
     "Название": SENDER_TITLE,
     "Отчество": "Николаевич",
@@ -282,23 +283,23 @@ def build_native_xml(doc_kind: str,
     })
     ET.SubElement(sender, "СвФЛ", ORG_FL)
     ET.SubElement(sender, "Склад", {
-        "Идентификатор": "284",
-        "Название": "ИП Плетнев",
+        "Идентификатор": COMPANY.warehouse_id,
+        "Название": COMPANY.warehouse_name,
     })
 
     receiver = ET.SubElement(doc, "Получатель")
     ET.SubElement(receiver, "Склад", {
-        "Название": "ИП Плетнев",
+        "Название": COMPANY.warehouse_name,
     })
     
     # === Для акта списания добавляем причину (ТаблСклад) ===
     if doc_kind == "writeoff":
         tabl_sklad = ET.SubElement(doc, "ТаблСклад")
         ET.SubElement(tabl_sklad, "СтрТабл", {
-            "Назначение": "Списание материально-производственных запасов на затраты",
-            "Получатель": "Фирлесс, ООО",
-            "Склад": "ИП Плетнев",
-            "Счет": "20-01",
+            "Назначение": COMPANY.writeoff_purpose,
+            "Получатель": COMPANY.recipient_name,
+            "Склад": COMPANY.warehouse_name,
+            "Счет": COMPANY.account,
         })
 
     xml_bytes = ET.tostring(
