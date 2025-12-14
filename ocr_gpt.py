@@ -125,13 +125,57 @@ def _parse_json_strict_or_relaxed(text: str):
     raise RuntimeError(f"GPT вернул невалидный JSON. Первые 500 символов:\n{text[:500]}")
 
 
-def _auto_rotate_image(img):
-    """Автоматический поворот изображения если оно вертикальное."""
-    width, height = img.size
-    # Если высота больше ширины больше чем в 1.3 раза - поворачиваем
-    if height > width * 1.3:
-        img = img.rotate(90, expand=True)
-    return img
+def _should_rotate_image(image_path: str) -> bool:
+    """
+    Спрашивает GPT-4o, нужно ли повернуть изображение на 90° для правильного чтения.
+    Возвращает True если нужен поворот, False если нет.
+    """
+    try:
+        b64 = encode_image(image_path)
+        
+        prompt = """Посмотри на эту таблицу и определи её ориентацию.
+
+ВОПРОС: Нужно ли повернуть это изображение на 90° по часовой стрелке, чтобы текст читался правильно (горизонтально слева направо)?
+
+ВАЖНО:
+- Если текст сейчас идёт ВЕРТИКАЛЬНО (снизу вверх или сверху вниз) → rotate: true
+- Если текст УЖЕ читается ГОРИЗОНТАЛЬНО (слева направо) → rotate: false
+
+Верни ТОЛЬКО JSON:
+{"rotate": true}  или  {"rotate": false}
+
+БЕЗ объяснений! ТОЛЬКО JSON!"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                        }
+                    ]
+                }
+            ],
+            max_tokens=50,
+            temperature=0
+        )
+        
+        text = response.choices[0].message.content or ""
+        result = _parse_json_strict_or_relaxed(text)
+        
+        import sys
+        print(f"[INFO] GPT определил ориентацию: {result}", file=sys.stderr)
+        
+        return result.get("rotate", False)
+        
+    except Exception as e:
+        import sys
+        print(f"[WARN] Ошибка определения ориентации GPT: {e}, оставляю как есть", file=sys.stderr)
+        return False
 
 
 def _process_multiple_columns(column_images: list) -> Dict:
@@ -251,25 +295,19 @@ def _split_table_into_columns(image_path: str) -> list:
         
         print(f"[INFO] Исходное изображение: {width}x{height} (соотношение {height/width:.2f}:1)", file=sys.stderr)
         
-        # УМНЫЙ ПОВОРОТ: если таблица вертикальная - пробуем повернуть
-        if height > width * 1.3:
-            print(f"[INFO] Вертикальная таблица, проверяю ориентацию...", file=sys.stderr)
-            rotated = img.rotate(90, expand=True)
-            rot_width, rot_height = rotated.size
+        # УМНЫЙ ПОВОРОТ через GPT: спрашиваем у GPT, нужен ли поворот
+        if _should_rotate_image(image_path):
+            print(f"[INFO] GPT рекомендует повернуть изображение", file=sys.stderr)
+            img = img.rotate(90, expand=True)
+            width, height = img.size
             
-            # Поворачиваем только если стала ЯВНО широкой (минимум 2:1)
-            # Это означает многоколоночную альбомную таблицу
-            if rot_width > rot_height * 2.0:
-                print(f"[INFO] После поворота {rot_width}x{rot_height} (соотношение {rot_width/rot_height:.2f}:1) - это перевернутая альбомная таблица!", file=sys.stderr)
-                img = rotated
-                width, height = rot_width, rot_height
-                
-                # Сохраняем повернутое изображение
-                rotated_path = str(Path(image_path).with_stem(Path(image_path).stem + "_rotated"))
-                img.save(rotated_path, format='PNG', optimize=False)
-                image_path = rotated_path
-            else:
-                print(f"[INFO] После поворота {rot_width}x{rot_height} (соотношение {rot_width/rot_height:.2f}:1) - это книжная таблица, оставляю вертикальной", file=sys.stderr)
+            # Сохраняем повернутое изображение
+            rotated_path = str(Path(image_path).with_stem(Path(image_path).stem + "_rotated"))
+            img.save(rotated_path, format='PNG', optimize=False)
+            image_path = rotated_path
+            print(f"[INFO] После поворота: {width}x{height}", file=sys.stderr)
+        else:
+            print(f"[INFO] GPT подтвердил правильную ориентацию, поворот не нужен", file=sys.stderr)
         
         # Если ширина больше высоты более чем в 1.5 раза - скорее всего несколько колонок
         if width > height * 1.5:
