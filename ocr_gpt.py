@@ -311,22 +311,38 @@ def _split_table_into_columns(image_path: str) -> list:
         
         # Если ширина больше высоты более чем в 1.5 раза - скорее всего несколько колонок
         if width > height * 1.5:
-            # Разделяем на части
-            num_columns = 2 if width < height * 2.5 else 4
-            print(f"[INFO] Широкая таблица ({width}x{height}), разделяю на {num_columns} колонки", file=sys.stderr)
+            # Определяем количество колонок по соотношению сторон
+            ratio = width / height
+            if ratio < 2.2:
+                num_columns = 2
+            elif ratio < 3.2:
+                num_columns = 3
+            else:
+                num_columns = 4
+            
+            print(f"[INFO] Широкая таблица ({width}x{height}, соотношение {ratio:.2f}:1), разделяю на {num_columns} колонки", file=sys.stderr)
             
             column_width = width // num_columns
             column_images = []
             
+            # Увеличенное перекрытие для надежности
+            overlap = 80  # px перекрытия между колонками
+            
             for i in range(num_columns):
+                # Базовые границы
                 left = i * column_width
                 right = (i + 1) * column_width if i < num_columns - 1 else width
                 
-                # Добавляем небольшое перекрытие для захвата границ
+                # Добавляем перекрытие для захвата всех данных
+                # Для первой колонки - расширяем вправо
+                # Для последней - расширяем влево
+                # Для средних - в обе стороны
                 if i > 0:
-                    left -= 20
+                    left = max(0, left - overlap)
                 if i < num_columns - 1:
-                    right += 20
+                    right = min(width, right + overlap)
+                
+                print(f"[INFO] Колонка {i+1}: границы [{left}:{right}] (ширина {right-left}px)", file=sys.stderr)
                 
                 column = img.crop((left, 0, right, height))
                 
