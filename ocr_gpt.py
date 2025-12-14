@@ -235,8 +235,7 @@ def _split_table_into_columns(image_path: str) -> list:
     Возвращает список путей к изображениям колонок.
     """
     try:
-        from PIL import Image
-        import numpy as np
+        from PIL import Image, ImageEnhance
         from pathlib import Path
         
         img = Image.open(image_path)
@@ -262,11 +261,26 @@ def _split_table_into_columns(image_path: str) -> list:
                 
                 column = img.crop((left, 0, right, height))
                 
-                # Сохраняем колонку
+                # КРИТИЧНО: Увеличиваем разрешение колонки для сохранения качества
+                col_width, col_height = column.size
+                # Если колонка меньше 2000px по ширине - увеличиваем
+                if col_width < 2000:
+                    scale = 2000 / col_width
+                    new_size = (int(col_width * scale), int(col_height * scale))
+                    column = column.resize(new_size, Image.Resampling.LANCZOS)
+                
+                # Улучшаем качество для лучшего распознавания
+                enhancer = ImageEnhance.Contrast(column)
+                column = enhancer.enhance(1.2)
+                enhancer = ImageEnhance.Sharpness(column)
+                column = enhancer.enhance(1.3)
+                
+                # Сохраняем в PNG без потери качества
                 col_path = str(Path(image_path).with_stem(
                     Path(image_path).stem + f"_col{i+1}"
-                ))
-                column.save(col_path, quality=95)
+                )).replace('.jpg', '.png').replace('.jpeg', '.png')
+                
+                column.save(col_path, format='PNG', optimize=False)
                 column_images.append(col_path)
             
             return column_images
@@ -282,47 +296,30 @@ def _split_table_into_columns(image_path: str) -> list:
 
 def _preprocess_image_for_ocr(image_path: str) -> str:
     """
-    Предобработка изображения для улучшения OCR.
+    Минимальная предобработка изображения - только автоповорот.
     Возвращает путь к обработанному изображению.
     
-    Применяет:
-    - Автоповорот если вертикальное
-    - Увеличение контраста
-    - Улучшение резкости
-    - Уменьшение шума
+    Основная обработка качества происходит при разделении на колонки.
     """
     try:
-        from PIL import Image, ImageEnhance, ImageFilter
+        from PIL import Image
         from pathlib import Path
         
         img = Image.open(image_path)
         
-        # Автоповорот
+        # Автоповорот если нужно
+        original_img = img
         img = _auto_rotate_image(img)
         
-        # Увеличиваем контраст для лучшей читаемости
-        enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(1.3)
+        # Если изображение было повернуто - сохраняем
+        if img.size != original_img.size:
+            processed_path = str(Path(image_path).with_stem(Path(image_path).stem + "_rotated"))
+            # Сохраняем в PNG для максимального качества
+            img.save(processed_path, format='PNG', optimize=False)
+            return processed_path
         
-        # Увеличиваем резкость
-        enhancer = ImageEnhance.Sharpness(img)
-        img = enhancer.enhance(1.5)
-        
-        # Уменьшаем шум (слегка размываем, затем увеличиваем резкость)
-        img = img.filter(ImageFilter.MedianFilter(size=3))
-        
-        # Если изображение слишком маленькое - увеличиваем
-        width, height = img.size
-        if width < 1500 or height < 1500:
-            scale = max(1500 / width, 1500 / height)
-            new_size = (int(width * scale), int(height * scale))
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
-        
-        # Сохраняем обработанное изображение
-        processed_path = str(Path(image_path).with_stem(Path(image_path).stem + "_processed"))
-        img.save(processed_path, quality=95)
-        
-        return processed_path
+        # Не было поворота - возвращаем оригинал
+        return image_path
         
     except ImportError:
         # PIL не установлен - возвращаем оригинал
