@@ -132,7 +132,19 @@ def transcribe_voice_from_telegram(file_id: str) -> str:
 def format_items(items: List[Dict]) -> str:
     if not items:
         return "Список пуст."
-    lines = [f"{i+1}. {it['name']} — {it['qty']}" for i, it in enumerate(items)]
+    
+    lines = []
+    for i, it in enumerate(items):
+        name = it.get('name', '')
+        catalog_name = it.get('catalog_name')
+        qty = it.get('qty', '')
+        
+        # Если есть нормализованное название и оно отличается от исходного
+        if catalog_name and catalog_name != name:
+            lines.append(f"{i+1}. {name} → {catalog_name} — {qty}")
+        else:
+            lines.append(f"{i+1}. {name} — {qty}")
+    
     return "\n".join(lines)
 
 
@@ -214,6 +226,81 @@ def handle_clear(chat_id: int):
     st["pending_confirm"] = False
     send_message(chat_id, "Список очищен.")
 
+
+def validate_and_normalize_items(items: List[Dict], doc_type: str) -> tuple:
+    """
+    Валидирует и нормализует названия товаров в списке.
+    Возвращает (validated_items, warnings)
+    
+    validated_items содержит:
+    - name: исходное название из OCR
+    - qty: количество
+    - catalog_name: нормализованное название из каталога/составов (если найдено)
+    
+    warnings: список предупреждений о проблемах
+    """
+    from daily_act import _pick_best_known_names, _parse_item_quantity
+    from catalog_lookup import get_purchase_item
+    from compositions import build_components_for_output
+    
+    validated = []
+    warnings = []
+    
+    for idx, item in enumerate(items):
+        name_input = str(item.get("name", "")).strip()
+        if not name_input:
+            continue
+        
+        qty = _parse_item_quantity(item.get("qty", ""))
+        if qty == 0:
+            warnings.append(f"• {name_input} — пустое или нулевое количество, пропущено")
+            continue
+        
+        try:
+            # Находим лучшее совпадение
+            best_match = _pick_best_known_names(name_input)
+            best_by_source = best_match.get("by_source", {})
+            catalog_name = None
+            
+            if doc_type == "income":
+                # Для прихода используем каталог
+                catalog_candidate = best_by_source.get("catalog")
+                target_name = catalog_candidate["name"] if catalog_candidate and catalog_candidate.get("name") else name_input
+                meta = get_purchase_item(target_name)
+                catalog_name = meta["name"]
+            else:
+                # Для производства/списания пробуем состав, потом каталог
+                composition_candidate = best_by_source.get("composition") or best_by_source.get("production")
+                recipe_name = composition_candidate["name"] if composition_candidate else name_input
+                
+                try:
+                    recipe = build_components_for_output(recipe_name, output_qty=qty)
+                    catalog_name = recipe["parent_name"]
+                except Exception:
+                    # Нет в составах - пробуем каталог
+                    catalog_candidate = best_by_source.get("catalog")
+                    target_name = catalog_candidate.get("name") if catalog_candidate and catalog_candidate.get("name") else name_input
+                    meta = get_purchase_item(target_name)
+                    catalog_name = meta["name"]
+            
+            validated.append({
+                "name": name_input,  # Исходное название
+                "qty": qty,
+                "catalog_name": catalog_name  # Нормализованное название
+            })
+            
+        except Exception as e:
+            # Товар не найден - оставляем исходное название
+            validated.append({
+                "name": name_input,
+                "qty": qty,
+                "catalog_name": None  # Не найден в каталоге
+            })
+            warnings.append(f"⚠️ {name_input} — не найден в каталоге")
+    
+    return validated, warnings
+
+
 def split_valid_invalid_items(items: List[Dict]):
     """
     Делим позиции на:
@@ -263,10 +350,20 @@ def send_act_by_type(chat_id: int,
                      items: List[Dict]):
     """
     Вызов нужной функции отправки в СБИС по типу документа.
-    Перед этим чистим список от мусора и предупреждаем о битых строках.
+    Теперь items уже содержат валидированные данные с catalog_name.
     """
-    # Сначала делим позиции на валидные и сломанные
-    valid_items, bad_items = split_valid_invalid_items(items)
+    # Подготовим items для отправки - используем catalog_name если есть
+    prepared_items = []
+    for it in items:
+        # Если есть catalog_name - используем его, иначе оригинальное name
+        item_name = it.get("catalog_name") or it.get("name")
+        prepared_items.append({
+            "name": item_name,
+            "qty": it.get("qty")
+        })
+    
+    # Делим позиции на валидные и сломанные (на всякий случай)
+    valid_items, bad_items = split_valid_invalid_items(prepared_items)
 
     if not valid_items:
         send_message(
@@ -505,20 +602,36 @@ def handle_text(chat_id: int, text: str):
             send_message(chat_id, f"Не смог применить правку через GPT: {e}")
             return
 
-        st["items"] = new_items
         if not new_items:
             send_message(chat_id, "После правки список пуст. Можешь прислать новую фотку или ввести позиции заново.")
             st["pending_confirm"] = False
             return
 
+        # Валидируем и нормализуем отредактированные позиции
+        send_message(chat_id, "Проверяю обновлённый список по каталогу...")
+        try:
+            validated_items, warnings = validate_and_normalize_items(new_items, st["doc_type"])
+        except Exception as e:
+            send_message(chat_id, f"Ошибка при проверке товаров: {e}")
+            return
+
+        if not validated_items:
+            send_message(chat_id, "После правки не осталось валидных позиций 😔")
+            st["pending_confirm"] = False
+            return
+
+        st["items"] = validated_items
+
         label = DOC_TYPE_LABELS.get(st["doc_type"], st["doc_type"])
-        send_message(
-            chat_id,
-            f"Тип документа: {label}\n"
-            "Обновлённый список позиций:\n"
-            + format_items(new_items)
-            + "\n\nВсе верно?"
-        )
+        msg = f"Тип документа: {label}\n"
+        msg += "Обновлённый список (будет отправлено в СБИС):\n"
+        msg += format_items(validated_items)
+        
+        if warnings:
+            msg += "\n\n⚠️ Предупреждения:\n" + "\n".join(warnings)
+        
+        msg += "\n\nВсе верно?"
+        send_message(chat_id, msg)
         # остаёмся в pending_confirm
         return
 
@@ -589,18 +702,33 @@ def handle_photo(chat_id: int, photos: List[Dict]):
         send_message(chat_id, "Не нашёл ни одной строки с количеством на фото 😔")
         return
 
-    st["items"] = items
+    # Валидация и нормализация названий сразу после OCR
+    send_message(chat_id, "Проверяю товары по каталогу...")
+    
+    try:
+        validated_items, warnings = validate_and_normalize_items(items, doc_type)
+    except Exception as e:
+        send_message(chat_id, f"Ошибка при проверке товаров: {e}")
+        return
+    
+    if not validated_items:
+        send_message(chat_id, "Не удалось распознать ни одной валидной позиции 😔")
+        return
+
+    st["items"] = validated_items
     st["doc_type"] = doc_type
     st["pending_confirm"] = True
 
     label = DOC_TYPE_LABELS.get(doc_type, doc_type)
-    send_message(
-        chat_id,
-        f"Тип документа: {label}\n"
-        "Нашёл такие позиции:\n"
-        + format_items(items)
-        + "\n\nВсе верно?"
-    )
+    msg = f"Тип документа: {label}\n"
+    msg += "Вот что будет отправлено в СБИС:\n"
+    msg += format_items(validated_items)
+    
+    if warnings:
+        msg += "\n\n⚠️ Предупреждения:\n" + "\n".join(warnings)
+    
+    msg += "\n\nВсе верно?"
+    send_message(chat_id, msg)
 
 
 def handle_callback_query(callback_query: dict):
