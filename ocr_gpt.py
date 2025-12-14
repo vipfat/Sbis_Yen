@@ -234,9 +234,10 @@ def _split_table_into_columns(image_path: str) -> list:
     Умное разделение таблицы на колонки с автоматическим поворотом.
     
     Логика:
-    1. Если таблица очень узкая (height > width * 2) - пробуем повернуть
-    2. Если после поворота стала широкой - это была перевернутая альбомная таблица
-    3. Широкие таблицы разделяем на 2-4 колонки
+    1. Если таблица вертикальная (height > width × 1.3) - пробуем повернуть
+    2. Если после поворота стала широкой (width > height × 1.5) - принимаем поворот
+    3. Если широкая - разделяем на 2-4 колонки
+    4. Иначе - оставляем без изменений
     
     Возвращает список путей к изображениям колонок.
     """
@@ -248,15 +249,17 @@ def _split_table_into_columns(image_path: str) -> list:
         img = Image.open(image_path)
         width, height = img.size
         
-        # УМНЫЙ ПОВОРОТ: если таблица очень узкая - возможно она перевернута
-        if height > width * 2:
-            print(f"[INFO] Обнаружена узкая вертикальная таблица ({width}x{height}), проверяю ориентацию", file=sys.stderr)
+        print(f"[INFO] Исходное изображение: {width}x{height} (соотношение {height/width:.2f}:1)", file=sys.stderr)
+        
+        # УМНЫЙ ПОВОРОТ: если таблица вертикальная - пробуем повернуть
+        if height > width * 1.3:
+            print(f"[INFO] Вертикальная таблица, проверяю ориентацию...", file=sys.stderr)
             rotated = img.rotate(90, expand=True)
             rot_width, rot_height = rotated.size
             
             # Если после поворота стала широкой - это была перевернутая альбомная таблица
             if rot_width > rot_height * 1.5:
-                print(f"[INFO] После поворота: {rot_width}x{rot_height} - это перевернутая альбомная таблица, поворачиваю", file=sys.stderr)
+                print(f"[INFO] После поворота {rot_width}x{rot_height} (соотношение {rot_width/rot_height:.2f}:1) - это перевернутая альбомная таблица!", file=sys.stderr)
                 img = rotated
                 width, height = rot_width, rot_height
                 
@@ -265,12 +268,13 @@ def _split_table_into_columns(image_path: str) -> list:
                 img.save(rotated_path, format='PNG', optimize=False)
                 image_path = rotated_path
             else:
-                print(f"[INFO] После поворота осталась узкой - это настоящая книжная таблица, оставляю вертикальной", file=sys.stderr)
+                print(f"[INFO] После поворота {rot_width}x{rot_height} - осталась вертикальной, это книжная таблица", file=sys.stderr)
         
         # Если ширина больше высоты более чем в 1.5 раза - скорее всего несколько колонок
         if width > height * 1.5:
             # Разделяем на части
             num_columns = 2 if width < height * 2.5 else 4
+            print(f"[INFO] Широкая таблица ({width}x{height}), разделяю на {num_columns} колонки", file=sys.stderr)
             
             column_width = width // num_columns
             column_images = []
