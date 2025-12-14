@@ -70,19 +70,59 @@ def _parse_json_strict_or_relaxed(text: str):
     """
     text = (text or "").strip()
 
+    # Убираем markdown code blocks если есть
+    text = re.sub(r'^```json\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'^```\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    text = text.strip()
+
     # Пробуем как есть
     try:
         return json.loads(text)
+    except json.JSONDecodeError as e:
+        # Логируем ошибку для отладки
+        import sys
+        print(f"[DEBUG] JSON parse error at position {e.pos}: {e.msg}", file=sys.stderr)
+        print(f"[DEBUG] Text around error: ...{text[max(0, e.pos-50):e.pos+50]}...", file=sys.stderr)
     except Exception:
         pass
 
-    # Ищем JSON-объект или массив
+    # Ищем JSON-объект (жадно, берём самый большой)
     m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        m = re.search(r"\[.*\]", text, re.S)
-    if not m:
-        raise RuntimeError(f"GPT вернул невалидный JSON:\n{text}")
-    return json.loads(m.group(0))
+    if m:
+        try:
+            json_str = m.group(0)
+            # Пробуем исправить типичные ошибки
+            # Убираем trailing commas перед закрывающими скобками
+            json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            # Если всё равно не парсится, пробуем построчно найти валидный JSON
+            pass
+    
+    # Ищем массив
+    m = re.search(r"\[.*\]", text, re.S)
+    if m:
+        try:
+            json_str = m.group(0)
+            json_str = re.sub(r',(\s*\])', r'\1', json_str)
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+    
+    # Последняя попытка: ищем JSON между первой { и последней }
+    first_brace = text.find('{')
+    last_brace = text.rfind('}')
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        try:
+            json_str = text[first_brace:last_brace+1]
+            json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+    
+    # Ничего не помогло
+    raise RuntimeError(f"GPT вернул невалидный JSON. Первые 500 символов:\n{text[:500]}")
 
 
 def _preprocess_image_for_ocr(image_path: str) -> str:
@@ -221,7 +261,7 @@ def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True) -> Dict
 
 ═══════════════════════════════════════════════════════════════════════════════
 
-ФОРМАТ ОТВЕТА — только JSON, без комментариев:
+ФОРМАТ ОТВЕТА — только валидный JSON:
 
 {
   "doc_type": "production",
@@ -231,13 +271,20 @@ def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True) -> Dict
   ]
 }
 
+КРИТИЧЕСКИ ВАЖНО:
+❌ НЕ добавляй trailing commas: {"name": "x", "qty": 1,} ← НЕПРАВИЛЬНО
+✅ Правильно: {"name": "x", "qty": 1}
+❌ НЕ добавляй комментарии в JSON
+❌ НЕ оборачивай в ```json ... ```
+❌ НЕ добавляй текст до или после JSON
+
 Где:
-• name — чистое название (без пробелов по краям)
-• qty — число (float), БЕЗ единиц измерения
+• name — строка, чистое название (без пробелов по краям)
+• qty — ЧИСЛО (float или int), БЕЗ единиц измерения, БЕЗ кавычек
 
-Если таблица пустая: {"doc_type": "...", "items": []}
+Если таблица пустая: {"doc_type": "production", "items": []}
 
-ТОЛЬКО JSON! Никакого текста до или после!
+ВЕРНИ ТОЛЬКО ВАЛИДНЫЙ JSON, НИЧЕГО БОЛЬШЕ!
 """
 
     response = client.chat.completions.create(
@@ -265,10 +312,22 @@ def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True) -> Dict
     # Логируем сырой ответ GPT
     _log_ocr_result(image_path, text)
     
-    raw = _parse_json_strict_or_relaxed(text)
+    try:
+        raw = _parse_json_strict_or_relaxed(text)
+    except Exception as e:
+        # Более понятная ошибка для пользователя
+        import sys
+        print(f"[ERROR] Не удалось распознать JSON от GPT: {e}", file=sys.stderr)
+        print(f"[ERROR] GPT ответ (первые 500 символов): {text[:500]}", file=sys.stderr)
+        raise RuntimeError(
+            "GPT вернул некорректный ответ. Попробуйте:\n"
+            "• Переснять фото с лучшим освещением\n"
+            "• Убедиться что таблица целиком в кадре\n"
+            "• Отправить фото повторно"
+        ) from e
 
     if not isinstance(raw, dict):
-        raise RuntimeError(f"Ожидался JSON-объект, а пришло:\n{text}")
+        raise RuntimeError(f"Ожидался JSON-объект, а пришло:\n{text[:500]}")
 
     doc_type = raw.get("doc_type", "").strip()
     items_raw = raw.get("items", [])
