@@ -296,37 +296,16 @@ def _split_table_into_columns(image_path: str) -> list:
 
 def _preprocess_image_for_ocr(image_path: str) -> str:
     """
-    Минимальная предобработка изображения - только автоповорот.
+    Минимальная предобработка изображения.
     Возвращает путь к обработанному изображению.
     
+    ВАЖНО: Автоповорот отключен - GPT-4o распознает текст в любой ориентации.
+    Это позволяет корректно обрабатывать как книжные, так и альбомные таблицы.
     Основная обработка качества происходит при разделении на колонки.
     """
-    try:
-        from PIL import Image
-        from pathlib import Path
-        
-        img = Image.open(image_path)
-        
-        # Автоповорот если нужно
-        original_img = img
-        img = _auto_rotate_image(img)
-        
-        # Если изображение было повернуто - сохраняем
-        if img.size != original_img.size:
-            processed_path = str(Path(image_path).with_stem(Path(image_path).stem + "_rotated"))
-            # Сохраняем в PNG для максимального качества
-            img.save(processed_path, format='PNG', optimize=False)
-            return processed_path
-        
-        # Не было поворота - возвращаем оригинал
-        return image_path
-        
-    except ImportError:
-        # PIL не установлен - возвращаем оригинал
-        return image_path
-    except Exception:
-        # Любая ошибка - возвращаем оригинал
-        return image_path
+    # Просто возвращаем оригинальное изображение
+    # GPT-4o достаточно умный, чтобы читать текст в любой ориентации
+    return image_path
 
 
 def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True, return_columns: bool = False) -> Dict:
