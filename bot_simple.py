@@ -67,6 +67,18 @@ def send_message(chat_id: int, text: str, reply_markup=None):
     api_post("sendMessage", data)
 
 
+def send_photo(chat_id: int, photo_path: str, caption: str = None):
+    """Отправляет фото в чат."""
+    url = f"{API_URL}/sendPhoto"
+    with open(photo_path, 'rb') as photo:
+        files = {'photo': photo}
+        data = {'chat_id': chat_id}
+        if caption:
+            data['caption'] = caption
+        resp = requests.post(url, files=files, data=data, timeout=60)
+    return resp.json()
+
+
 def send_product_choice(chat_id: int, original: str, suggestions: List[tuple], item_index: int, progress: str = None):
     """
     Отправляет сообщение с inline кнопками для выбора похожего товара.
@@ -690,10 +702,20 @@ def handle_photo(chat_id: int, photos: List[Dict]):
     send_message(chat_id, "Обрабатываю таблицу на фото через GPT...")
 
     try:
-        doc = extract_doc_from_image_gpt(str(local_path))
+        doc = extract_doc_from_image_gpt(str(local_path), return_columns=True)
     except Exception as e:
         send_message(chat_id, f"Ошибка распознавания таблицы: {e}")
         return
+
+    # Если таблица была разделена на колонки - показываем их
+    column_images = doc.get("column_images", [])
+    if column_images and len(column_images) > 1:
+        send_message(chat_id, f"📸 Таблица разделена на {len(column_images)} колонок для точного распознавания:")
+        for idx, col_path in enumerate(column_images, 1):
+            try:
+                send_photo(chat_id, col_path, f"Колонка {idx}/{len(column_images)}")
+            except Exception as e:
+                print(f"Не удалось отправить колонку {idx}: {e}")
 
     doc_type = doc.get("doc_type", "production")
     items = doc.get("items", [])

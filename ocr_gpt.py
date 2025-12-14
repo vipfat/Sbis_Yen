@@ -332,17 +332,19 @@ def _preprocess_image_for_ocr(image_path: str) -> str:
         return image_path
 
 
-def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True) -> Dict:
+def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True, return_columns: bool = False) -> Dict:
     """
     Отправляет фото таблицы в GPT и возвращает структуру:
     {
       "doc_type": "production" | "writeoff" | "income",
-      "items": [ {"name": "...", "qty": float}, ... ]
+      "items": [ {"name": "...", "qty": float}, ... ],
+      "column_images": [ ... ]  # опционально, если return_columns=True
     }
     
     Args:
         image_path: Путь к изображению
         preprocess: Применять ли предобработку изображения (по умолчанию True)
+        return_columns: Возвращать ли пути к разделенным колонкам (по умолчанию False)
     """
     # Предобработка изображения для лучшего распознавания
     if preprocess:
@@ -355,7 +357,10 @@ def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True) -> Dict
     if len(column_images) > 1:
         import sys
         print(f"[INFO] Обнаружено {len(column_images)} колонок, обрабатываю по отдельности", file=sys.stderr)
-        return _process_multiple_columns(column_images)
+        result = _process_multiple_columns(column_images)
+        if return_columns:
+            result["column_images"] = column_images
+        return result
     
     # Одна колонка - обычная обработка
     b64 = encode_image(image_path)
