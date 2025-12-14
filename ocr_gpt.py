@@ -593,11 +593,16 @@ def _post_process_ocr_items(items: List[Dict]) -> List[Dict]:
     - Названия-числа (ошибка распознавания колонок)
     - Слишком длинные названия (возможно склеились колонки)
     """
+    import sys
+    
     if not items:
         return items
     
+    print(f"[DEBUG] Постобработка OCR: получено {len(items)} позиций", file=sys.stderr)
+    
     cleaned_items = []
-    seen_names = {}  # name_lower -> first_qty (для обнаружения дубликатов)
+    seen_names = {}  # name_lower -> (first_qty, count) для обнаружения дубликатов
+    filtered_count = 0
     
     for idx, item in enumerate(items):
         name = item.get("name", "").strip()
@@ -605,27 +610,36 @@ def _post_process_ocr_items(items: List[Dict]) -> List[Dict]:
         
         # Пропускаем пустые
         if not name:
+            filtered_count += 1
+            print(f"[DEBUG] Отфильтровано: пустое название (позиция {idx+1})", file=sys.stderr)
             continue
         
-        # Проверка 1: Название не должно быть просто числом
-        try:
-            float(name.replace(",", ".").replace(" ", ""))
-            # Это число, а не название - пропускаем
-            continue
-        except ValueError:
-            pass  # Всё ок
+        # Проверка 1: Название не должно быть ТОЛЬКО числом (без букв вообще)
+        if not any(c.isalpha() for c in name):
+            try:
+                float(name.replace(",", ".").replace(" ", ""))
+                # Это чистое число без букв - пропускаем
+                filtered_count += 1
+                print(f"[DEBUG] Отфильтровано: название-число '{name}' (позиция {idx+1})", file=sys.stderr)
+                continue
+            except ValueError:
+                pass  # Содержит не-числовые символы, оставляем
         
         # Проверка 2: Нереальные количества
         if qty > 10000:
             # Скорее всего взята не та колонка или ошибка
-            # Попробуем разделить на 1000
             if qty > 100000:
+                filtered_count += 1
+                print(f"[DEBUG] Отфильтровано: нереальное количество {qty} для '{name}' (позиция {idx+1})", file=sys.stderr)
                 continue  # Слишком большое, пропускаем совсем
+            # Попробуем разделить на 1000
+            old_qty = qty
             qty = qty / 1000
             item["qty"] = qty
+            print(f"[DEBUG] Исправлено количество: {old_qty} → {qty} для '{name}'", file=sys.stderr)
         
         # Проверка 3: Слишком длинные названия (возможно склеились колонки)
-        if len(name) > 100:
+        if len(name) > 150:
             # Пытаемся найти число в конце и отрезать
             parts = name.split()
             if len(parts) > 1:
@@ -644,19 +658,28 @@ def _post_process_ocr_items(items: List[Dict]) -> List[Dict]:
         name_lower = name.lower()
         if name_lower in seen_names:
             # Дубликат найден
-            first_qty = seen_names[name_lower]
+            first_qty, dup_count = seen_names[name_lower]
             
             # Если количества сильно отличаются - возможно это разные позиции
             if abs(qty - first_qty) > 0.1:
-                # Добавляем номер к названию
-                name = f"{name} ({idx+1})"
+                # Разные количества - считаем разными позициями
+                dup_count += 1
+                name = f"{name} ({dup_count})"
+                seen_names[name_lower] = (first_qty, dup_count)
+                print(f"[DEBUG] Дубликат с разным количеством: '{name}' qty={qty} (первый был {first_qty})", file=sys.stderr)
             else:
-                # Скорее всего ошибка - пропускаем дубликат
-                continue
+                # Одинаковые количества - возможно реальный дубликат или ошибка OCR
+                # ОСЛАБЛЯЕМ: оставляем, но нумеруем
+                dup_count += 1
+                name = f"{name} ({dup_count})"
+                seen_names[name_lower] = (first_qty, dup_count)
+                print(f"[DEBUG] Дубликат с одинаковым количеством: '{name}' qty={qty}", file=sys.stderr)
+        else:
+            seen_names[name_lower] = (qty, 1)
         
-        seen_names[name_lower] = qty
         cleaned_items.append({"name": name, "qty": qty})
     
+    print(f"[DEBUG] Постобработка: осталось {len(cleaned_items)} позиций, отфильтровано {filtered_count}", file=sys.stderr)
     return cleaned_items
 
 
