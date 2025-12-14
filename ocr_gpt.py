@@ -257,8 +257,9 @@ def _split_table_into_columns(image_path: str) -> list:
             rotated = img.rotate(90, expand=True)
             rot_width, rot_height = rotated.size
             
-            # Если после поворота стала широкой - это была перевернутая альбомная таблица
-            if rot_width > rot_height * 1.5:
+            # Поворачиваем только если стала ЯВНО широкой (минимум 2:1)
+            # Это означает многоколоночную альбомную таблицу
+            if rot_width > rot_height * 2.0:
                 print(f"[INFO] После поворота {rot_width}x{rot_height} (соотношение {rot_width/rot_height:.2f}:1) - это перевернутая альбомная таблица!", file=sys.stderr)
                 img = rotated
                 width, height = rot_width, rot_height
@@ -268,7 +269,7 @@ def _split_table_into_columns(image_path: str) -> list:
                 img.save(rotated_path, format='PNG', optimize=False)
                 image_path = rotated_path
             else:
-                print(f"[INFO] После поворота {rot_width}x{rot_height} - осталась вертикальной, это книжная таблица", file=sys.stderr)
+                print(f"[INFO] После поворота {rot_width}x{rot_height} (соотношение {rot_width/rot_height:.2f}:1) - это книжная таблица, оставляю вертикальной", file=sys.stderr)
         
         # Если ширина больше высоты более чем в 1.5 раза - скорее всего несколько колонок
         if width > height * 1.5:
