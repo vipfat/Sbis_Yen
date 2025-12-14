@@ -231,15 +231,41 @@ def _process_single_column(image_path: str, col_num: int, total_cols: int) -> Di
 
 def _split_table_into_columns(image_path: str) -> list:
     """
-    Разделяет широкую таблицу на отдельные колонки.
+    Умное разделение таблицы на колонки с автоматическим поворотом.
+    
+    Логика:
+    1. Если таблица очень узкая (height > width * 2) - пробуем повернуть
+    2. Если после поворота стала широкой - это была перевернутая альбомная таблица
+    3. Широкие таблицы разделяем на 2-4 колонки
+    
     Возвращает список путей к изображениям колонок.
     """
     try:
         from PIL import Image, ImageEnhance
         from pathlib import Path
+        import sys
         
         img = Image.open(image_path)
         width, height = img.size
+        
+        # УМНЫЙ ПОВОРОТ: если таблица очень узкая - возможно она перевернута
+        if height > width * 2:
+            print(f"[INFO] Обнаружена узкая вертикальная таблица ({width}x{height}), проверяю ориентацию", file=sys.stderr)
+            rotated = img.rotate(90, expand=True)
+            rot_width, rot_height = rotated.size
+            
+            # Если после поворота стала широкой - это была перевернутая альбомная таблица
+            if rot_width > rot_height * 1.5:
+                print(f"[INFO] После поворота: {rot_width}x{rot_height} - это перевернутая альбомная таблица, поворачиваю", file=sys.stderr)
+                img = rotated
+                width, height = rot_width, rot_height
+                
+                # Сохраняем повернутое изображение
+                rotated_path = str(Path(image_path).with_stem(Path(image_path).stem + "_rotated"))
+                img.save(rotated_path, format='PNG', optimize=False)
+                image_path = rotated_path
+            else:
+                print(f"[INFO] После поворота осталась узкой - это настоящая книжная таблица, оставляю вертикальной", file=sys.stderr)
         
         # Если ширина больше высоты более чем в 1.5 раза - скорее всего несколько колонок
         if width > height * 1.5:
