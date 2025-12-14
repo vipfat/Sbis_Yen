@@ -160,6 +160,69 @@ def format_items(items: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def _smart_parse_quantity(parts: list) -> tuple:
+    """
+    Умный парсинг количества из списка слов.
+    Возвращает (name, qty) или (None, None) если не смог распознать.
+    
+    Обрабатывает случаи:
+    - "Ветчина 2" → ("Ветчина", 2.0)
+    - "Ветчина 2 0.97" → ("Ветчина", 2.097)  # голосовой ввод "два ноль девяносто семь"
+    - "Вода 3 0.33" → ("Вода", 3.033)
+    - "Мука 5,5" → ("Мука", 5.5)
+    """
+    if len(parts) < 2:
+        return None, None
+    
+    # Ищем все числа с конца
+    numbers = []
+    name_parts = []
+    
+    for part in reversed(parts):
+        try:
+            # Пробуем преобразовать в число
+            num = float(part.replace(",", "."))
+            numbers.append(num)
+        except ValueError:
+            # Это не число - часть названия
+            name_parts.append(part)
+            # После первого не-числа все остальное - название
+            name_parts.extend(reversed(parts[:len(parts)-len(numbers)-len(name_parts)]))
+            break
+    
+    if not numbers:
+        return None, None
+    
+    name = " ".join(reversed(name_parts)).strip()
+    
+    if not name:
+        return None, None
+    
+    # Логика объединения чисел
+    if len(numbers) == 1:
+        # Простой случай: одно число
+        qty = numbers[0]
+    elif len(numbers) == 2:
+        # Два числа: скорее всего голосовой ввод типа "2 0.97" = "два ноль девяносто семь"
+        # Проверяем: если первое число маленькое (< 100) и второе < 1, то объединяем
+        num1, num2 = numbers[1], numbers[0]  # инвертируем обратно
+        
+        if num1 < 100 and 0 < num2 < 1:
+            # "2 0.97" → 2.097 (добавляем дробную часть справа)
+            qty = num1 + num2 / 100
+        elif num1 < 100 and num2 >= 1 and num2 < 10:
+            # "3 0.33" может быть "три ноль тридцать три" → 3.033
+            qty = num1 + num2 / 1000
+        else:
+            # Непонятный случай - берём последнее число
+            qty = num2
+    else:
+        # Больше двух чисел - берём последнее
+        qty = numbers[0]
+    
+    return name, qty
+
+
 def parse_items_from_text(text: str):
     """Достаём из строки позиции вида "Название Количество", перечисленные через запятую/перенос."""
 
@@ -169,18 +232,10 @@ def parse_items_from_text(text: str):
 
     for chunk in chunks:
         parts = chunk.split()
-        if len(parts) < 2:
-            errors.append(chunk)
-            continue
-
-        try:
-            qty = float(parts[-1].replace(",", "."))
-        except ValueError:
-            errors.append(chunk)
-            continue
-
-        name = " ".join(parts[:-1]).strip()
-        if not name:
+        
+        name, qty = _smart_parse_quantity(parts)
+        
+        if name is None or qty is None:
             errors.append(chunk)
             continue
 
