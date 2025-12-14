@@ -357,13 +357,21 @@ def validate_and_normalize_items(items: List[Dict], doc_type: str) -> tuple:
             })
             
         except Exception as e:
-            # Товар не найден - оставляем исходное название
+            # Товар не найден - пробуем найти похожие для подсказки
+            from name_matching import find_candidates
+            candidates = find_candidates(name_input, limit=3)
+            
             validated.append({
                 "name": name_input,
                 "qty": qty,
                 "catalog_name": None  # Не найден в каталоге
             })
-            warnings.append(f"⚠️ {name_input} — не найден в каталоге")
+            
+            if candidates:
+                candidates_str = ", ".join([f"'{c['name']}'" for c in candidates[:3]])
+                warnings.append(f"⚠️ {name_input} — не найден. Может быть: {candidates_str}?")
+            else:
+                warnings.append(f"⚠️ {name_input} — не найден в каталоге")
     
     return validated, warnings
 
@@ -712,12 +720,30 @@ def handle_text(chat_id: int, text: str):
         )
         return
 
-    st["items"].extend(items)
+    # Валидируем введённые позиции через каталог
+    send_message(chat_id, "Проверяю по каталогу...")
+    try:
+        validated_items, warnings = validate_and_normalize_items(items, st["doc_type"])
+    except Exception as e:
+        send_message(chat_id, f"Ошибка при проверке товаров: {e}")
+        return
 
-    added_lines = [f"- {it['name']} — {it['qty']}" for it in items]
-    msg = "Добавил:\n" + "\n".join(added_lines)
+    if not validated_items:
+        send_message(chat_id, "Не удалось найти ни одной позиции в каталоге 😔")
+        return
+
+    # Добавляем валидированные позиции
+    st["items"].extend(validated_items)
+
+    # Показываем что будет отправлено в СБИС (с трансформациями)
+    msg = "✅ Добавил (будет отправлено в СБИС):\n"
+    msg += format_items(validated_items)
+    
+    if warnings:
+        msg += "\n\n⚠️ Предупреждения:\n" + "\n".join(warnings)
+    
     if errors:
-        msg += "\n\nНе разобрал строки:\n" + "\n".join(f"- {e}" for e in errors)
+        msg += "\n\n❌ Не разобрал строки:\n" + "\n".join(f"- {e}" for e in errors)
 
     send_message(chat_id, msg)
 
