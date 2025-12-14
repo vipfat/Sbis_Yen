@@ -125,12 +125,168 @@ def _parse_json_strict_or_relaxed(text: str):
     raise RuntimeError(f"GPT вернул невалидный JSON. Первые 500 символов:\n{text[:500]}")
 
 
+def _auto_rotate_image(img):
+    """Автоматический поворот изображения если оно вертикальное."""
+    width, height = img.size
+    # Если высота больше ширины больше чем в 1.3 раза - поворачиваем
+    if height > width * 1.3:
+        img = img.rotate(90, expand=True)
+    return img
+
+
+def _process_multiple_columns(column_images: list) -> Dict:
+    """
+    Обрабатывает несколько колонок таблицы по отдельности и объединяет результаты.
+    """
+    all_items = []
+    doc_type = "production"  # По умолчанию
+    
+    for idx, col_path in enumerate(column_images):
+        import sys
+        print(f"[INFO] Обрабатываю колонку {idx+1}/{len(column_images)}", file=sys.stderr)
+        
+        try:
+            # Обрабатываем колонку с более строгим промптом
+            result = _process_single_column(col_path, idx+1, len(column_images))
+            
+            # Берём тип документа из первой колонки
+            if idx == 0:
+                doc_type = result.get("doc_type", "production")
+            
+            # Добавляем items
+            items = result.get("items", [])
+            all_items.extend(items)
+            
+            print(f"[INFO] Колонка {idx+1}: найдено {len(items)} позиций", file=sys.stderr)
+            
+        except Exception as e:
+            print(f"[WARN] Ошибка обработки колонки {idx+1}: {e}", file=sys.stderr)
+            continue
+    
+    return {
+        "doc_type": doc_type,
+        "items": all_items
+    }
+
+
+def _process_single_column(image_path: str, col_num: int, total_cols: int) -> Dict:
+    """Обрабатывает одну колонку таблицы."""
+    b64 = encode_image(image_path)
+    
+    prompt = f"""
+Ты распознаёшь ОДНУ колонку таблицы (колонка {col_num} из {total_cols}).
+
+ВАЖНО: Это только ОДНА вертикальная колонка! НЕ читай горизонтально!
+
+ЗАДАЧА:
+1. Определи тип документа по заголовку:
+   - "Производство" = "production"
+   - "Списание" = "writeoff"
+   - "Приход" = "income"
+
+2. Прочитай таблицу СТРОГО СВЕРХУ ВНИЗ:
+   - Каждая строка: [Название] [Количество]
+   - Пропускай пустые строки
+   - Если количество = прочерк/пусто → пропусти
+
+ВЕРНИ JSON:
+{{
+  "doc_type": "production",
+  "items": [
+    {{"name": "Название", "qty": 5.5}}
+  ]
+}}
+
+БЕЗ trailing commas! БЕЗ markdown! ТОЛЬКО JSON!
+"""
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}"
+                        },
+                    },
+                ],
+            }
+        ],
+        max_tokens=500,
+        temperature=0,
+    )
+    
+    text = response.choices[0].message.content or ""
+    raw = _parse_json_strict_or_relaxed(text)
+    
+    if not isinstance(raw, dict):
+        return {"doc_type": "production", "items": []}
+    
+    return raw
+
+
+def _split_table_into_columns(image_path: str) -> list:
+    """
+    Разделяет широкую таблицу на отдельные колонки.
+    Возвращает список путей к изображениям колонок.
+    """
+    try:
+        from PIL import Image
+        import numpy as np
+        from pathlib import Path
+        
+        img = Image.open(image_path)
+        width, height = img.size
+        
+        # Если ширина больше высоты более чем в 1.5 раза - скорее всего несколько колонок
+        if width > height * 1.5:
+            # Разделяем на части
+            num_columns = 2 if width < height * 2.5 else 4
+            
+            column_width = width // num_columns
+            column_images = []
+            
+            for i in range(num_columns):
+                left = i * column_width
+                right = (i + 1) * column_width if i < num_columns - 1 else width
+                
+                # Добавляем небольшое перекрытие для захвата границ
+                if i > 0:
+                    left -= 20
+                if i < num_columns - 1:
+                    right += 20
+                
+                column = img.crop((left, 0, right, height))
+                
+                # Сохраняем колонку
+                col_path = str(Path(image_path).with_stem(
+                    Path(image_path).stem + f"_col{i+1}"
+                ))
+                column.save(col_path, quality=95)
+                column_images.append(col_path)
+            
+            return column_images
+        
+        # Если таблица не широкая - возвращаем как есть
+        return [image_path]
+        
+    except Exception as e:
+        import sys
+        print(f"[WARN] Не удалось разделить на колонки: {e}", file=sys.stderr)
+        return [image_path]
+
+
 def _preprocess_image_for_ocr(image_path: str) -> str:
     """
     Предобработка изображения для улучшения OCR.
     Возвращает путь к обработанному изображению.
     
     Применяет:
+    - Автоповорот если вертикальное
     - Увеличение контраста
     - Улучшение резкости
     - Уменьшение шума
@@ -140,6 +296,9 @@ def _preprocess_image_for_ocr(image_path: str) -> str:
         from pathlib import Path
         
         img = Image.open(image_path)
+        
+        # Автоповорот
+        img = _auto_rotate_image(img)
         
         # Увеличиваем контраст для лучшей читаемости
         enhancer = ImageEnhance.Contrast(img)
@@ -189,6 +348,16 @@ def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True) -> Dict
     if preprocess:
         image_path = _preprocess_image_for_ocr(image_path)
     
+    # Разделяем на колонки если таблица широкая
+    column_images = _split_table_into_columns(image_path)
+    
+    # Если несколько колонок - обрабатываем каждую отдельно
+    if len(column_images) > 1:
+        import sys
+        print(f"[INFO] Обнаружено {len(column_images)} колонок, обрабатываю по отдельности", file=sys.stderr)
+        return _process_multiple_columns(column_images)
+    
+    # Одна колонка - обычная обработка
     b64 = encode_image(image_path)
 
     prompt = """
@@ -288,7 +457,7 @@ def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True) -> Dict
 """
 
     response = client.chat.completions.create(
-        model="gpt-4.1",
+        model="gpt-4o",
         messages=[
             {
                 "role": "user",
