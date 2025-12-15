@@ -3,9 +3,13 @@ import base64
 import os
 import json
 import re
+import sys
+import asyncio
 import cv2
+import numpy as np
 from pathlib import Path
 from typing import List, Dict
+from PIL import Image, ImageEnhance
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -32,7 +36,6 @@ def _get_openai_client() -> OpenAI:
 def _log_ocr_result(image_path: str, gpt_response: str):
     """Логируем результат OCR для отладки."""
     from datetime import datetime
-    from pathlib import Path
     
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
@@ -93,7 +96,6 @@ def _parse_json_strict_or_relaxed(text: str):
         return json.loads(text)
     except json.JSONDecodeError as e:
         # Логируем ошибку для отладки
-        import sys
         print(f"[DEBUG] JSON parse error at position {e.pos}: {e.msg}", file=sys.stderr)
         print(f"[DEBUG] Text around error: ...{text[max(0, e.pos-50):e.pos+50]}...", file=sys.stderr)
     except Exception:
@@ -179,13 +181,11 @@ def _should_rotate_image(image_path: str) -> bool:
         text = response.choices[0].message.content or ""
         result = _parse_json_strict_or_relaxed(text)
         
-        import sys
         print(f"[INFO] GPT определил ориентацию: {result}", file=sys.stderr)
         
         return result.get("rotate", False)
         
     except Exception as e:
-        import sys
         print(f"[WARN] Ошибка определения ориентации GPT: {e}, оставляю как есть", file=sys.stderr)
         return False
 
@@ -195,7 +195,6 @@ def _process_multiple_columns(column_images: list) -> Dict:
     Обрабатывает несколько колонок таблицы по отдельности и объединяет результаты.
     Удаляет дубликаты, которые попали в соседние колонки из-за перекрытия.
     """
-    import sys
     
     all_items = []
     doc_type = "production"  # По умолчанию
@@ -319,9 +318,6 @@ def _split_table_into_columns(image_path: str) -> list:
     Возвращает список путей к изображениям колонок.
     """
     try:
-        from PIL import Image, ImageEnhance
-        from pathlib import Path
-        import sys
         
         img = Image.open(image_path)
         width, height = img.size
@@ -407,7 +403,6 @@ def _split_table_into_columns(image_path: str) -> list:
         return [image_path]
         
     except Exception as e:
-        import sys
         print(f"[WARN] Не удалось разделить на колонки: {e}", file=sys.stderr)
         return [image_path]
 
@@ -437,7 +432,6 @@ async def extract_row_data_gpt(row_image_path: str, row_index: int) -> Dict:
     Returns:
         {"name": str, "qty": float, "has_data": bool}
     """
-    import sys
     
     b64 = encode_image(row_image_path)
     
@@ -501,7 +495,6 @@ async def process_rows_parallel(row_images: List[str]) -> List[Dict]:
     Returns:
         List[{"name": str, "qty": float}]
     """
-    import asyncio
     
     print(f"[PARALLEL] Обработка {len(row_images)} строк...", file=sys.stderr)
     
@@ -535,8 +528,6 @@ def extract_doc_from_image_rowwise(image_path: str) -> Dict:
     Returns:
         {"doc_type": str, "items": List[{"name": str, "qty": float}], "method": "rowwise"}
     """
-    import asyncio
-    import sys
     from table_row_detector import detect_table_rows, split_table_into_rows
     
     print(f"[ROWWISE] Начинаю обработку: {Path(image_path).name}", file=sys.stderr)
@@ -570,7 +561,6 @@ def extract_doc_from_image_rowwise(image_path: str) -> Dict:
 
 def _detect_doc_type_from_header(image_path: str) -> str:
     """Быстрая детекция типа документа из заголовка (верхние 10% изображения)."""
-    import sys
     
     img = cv2.imread(image_path)
     h = img.shape[0]
@@ -636,7 +626,6 @@ def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True, return_
     
     # Если несколько колонок - обрабатываем каждую отдельно
     if len(column_images) > 1:
-        import sys
         print(f"[INFO] Обнаружено {len(column_images)} колонок, обрабатываю по отдельности", file=sys.stderr)
         result = _process_multiple_columns(column_images)
         if return_columns:
@@ -808,7 +797,6 @@ def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True, return_
         raw = _parse_json_strict_or_relaxed(text)
     except Exception as e:
         # Более понятная ошибка для пользователя
-        import sys
         print(f"[ERROR] Не удалось распознать JSON от GPT: {e}", file=sys.stderr)
         print(f"[ERROR] GPT ответ (первые 500 символов): {text[:500]}", file=sys.stderr)
         raise RuntimeError(
@@ -866,7 +854,6 @@ def _post_process_ocr_items(items: List[Dict]) -> List[Dict]:
     - Названия-числа (ошибка распознавания колонок)
     - Слишком длинные названия (возможно склеились колонки)
     """
-    import sys
     
     if not items:
         return items
