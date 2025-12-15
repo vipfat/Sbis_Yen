@@ -16,12 +16,7 @@ from daily_act import (
     send_income_act,
 )
 from catalog_lookup import ProductNotFoundError, MultipleProductsNotFoundError
-from ocr_gpt import (
-    correct_items_with_instruction,
-    extract_doc_from_image_gpt,
-    extract_doc_from_image_rowwise,
-    transcribe_audio,
-)
+from voice_handler import transcribe_audio, enhance_transcription_with_gpt
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -280,21 +275,22 @@ def handle_start(chat_id: int):
 
     send_message(
         chat_id,
-        "Привет! Я бот для актов в СБИС.\n\n"
-        "Режимы по фото:\n"
-        "  В заголовке листа пишешь: Производство / Списание / Приход,\n"
-        "  кидаешь фото таблицы с количествами — я определяю тип документа, "
-        "распознаю позиции, показываю и спрашиваю: «Все верно?». "
-        "Если ответишь «да» — отправлю акт нужного типа в СБИС.\n\n"
-        "Можно править текстом или голосом:\n"
-        "  «тесто не 2, а 3», «измени песто на тесто», «убери крутоны, добавь Крылышки 4».\n"
-        "  Голосовое тоже распознаю и применю как правку.\n\n"
-        "Команды:\n"
+        "🎯 Привет! Я бот для актов в СБИС через голосовой ввод.\n\n"
+        "📝 Как работать:\n"
+        "1️⃣ Выбери тип документа: напиши «Производство», «Списание» или «Приход»\n"
+        "2️⃣ Добавляй позиции — текстом или голосом в формате «Название Количество»:\n"
+        "   • Текст: «Борило 2,5», «Песто 1,2 Крутоны 0,8»\n"
+        "   • Голос: просто надикт��й список\n"
+        "3️⃣ Когда закончишь — напиши «отправить»\n\n"
+        "🎤 Голосовой ввод:\n"
+        "  • Работает Whisper + GPT для исправления ошибок\n"
+        "  • Можно диктовать несколько позиций подряд\n"
+        "  • Дробные числа: «два целых семнадцать» → 2,17\n\n"
+        "📋 Команды:\n"
         "  /list — показать текущий список\n"
         "  /clear — очистить список\n"
-        "  /send <номер> [дд.мм.гггг] — вручную отправить акт с текущим списком (тип берётся из последнего фото)\n\n"
-        "Можно без фото и команд: напиши Производство/Списание/Приход, затем позиции в формате «Название Количество»,"
-        " а для отправки — слово «отправить» (номер/дату придумаю сам)."
+        "  /send <номер> [дд.мм.гггг] — отправить акт\n\n"
+        "💡 Бот автоматически проверяет товары по каталогу и нормализует названия."
     )
 
 
@@ -634,19 +630,25 @@ def handle_voice(chat_id: int, voice: Dict):
     if not file_id:
         return
 
-    send_message(chat_id, "Распознаю голосовое...")
+    send_message(chat_id, "🎤 Распознаю голосовое...")
 
     try:
-        text = transcribe_voice_from_telegram(file_id)
+        # Шаг 1: Распознаем через Whisper
+        raw_text = transcribe_voice_from_telegram(file_id)
+        
+        # Шаг 2: Улучшаем через GPT (исправляем ошибки)
+        enhanced_text = enhance_transcription_with_gpt(raw_text)
+        
+        text = enhanced_text
     except Exception as e:
-        send_message(chat_id, f"Не смог распознать голосовое: {e}")
+        send_message(chat_id, f"❌ Не смог распознать голосовое: {e}")
         return
 
     if not text:
         send_message(chat_id, "В голосовом не разобрал текст.")
         return
 
-    send_message(chat_id, f"Распознал голосовое:\n{text}")
+    send_message(chat_id, f"✓ Распознал:\n{text}")
     handle_text(chat_id, text)
 
 
@@ -789,102 +791,7 @@ def handle_text(chat_id: int, text: str):
         send_message(chat_id, msg)
 
 
-def handle_photo(chat_id: int, photos: List[Dict]):
-    """
-    Обработка фото: скачиваем, отправляем в GPT-OCR, кладём список в state и спрашиваем подтверждение.
-    """
-    st = get_state(chat_id)
 
-    if not photos:
-        return
-
-    # Берём самое большое фото
-    photo = photos[-1]
-    file_id = photo["file_id"]
-
-    file_info = api_get("getFile", {"file_id": file_id})
-    if not file_info.get("ok"):
-        send_message(chat_id, f"Не удалось получить файл фото: {file_info}")
-        return
-
-    file_path = file_info["result"]["file_path"]
-    file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
-
-    resp = requests.get(file_url, timeout=60)
-    if resp.status_code != 200:
-        send_message(chat_id, f"Ошибка загрузки фото: HTTP {resp.status_code}")
-        return
-
-    tmp_dir = Path("tmp_images")
-    tmp_dir.mkdir(exist_ok=True)
-    local_path = tmp_dir / f"{chat_id}_{file_id}.jpg"
-    with open(local_path, "wb") as f:
-        f.write(resp.content)
-
-    send_message(chat_id, "Обрабатываю таблицу на фото...")
-
-    try:
-        # Гибридное распознавание: Tesseract → GPT fallback
-        doc = extract_doc_from_image_rowwise(str(local_path))
-        
-        # Показываем метод распознавания
-        method = doc.get("method", "unknown")
-        if method == "tesseract":
-            quality = doc.get("quality", {})
-            send_message(chat_id, f"✓ Распознано через Tesseract (быстро, conf={quality.get('avg_confidence', 0):.0f}%)")
-        elif method == "gpt-fallback":
-            send_message(chat_id, "⚡ Использован GPT (Tesseract не справился)")
-        elif method == "gpt":
-            send_message(chat_id, "⚡ Использован GPT")
-            
-    except Exception as e:
-        send_message(chat_id, f"Ошибка распознавания таблицы: {e}")
-        return
-
-    # Если таблица была разделена на колонки - показываем их (только для GPT)
-    column_images = doc.get("column_images", [])
-    if column_images and len(column_images) > 1:
-        send_message(chat_id, f"📸 Таблица разделена на {len(column_images)} колонок для точного распознавания:")
-        for idx, col_path in enumerate(column_images, 1):
-            try:
-                send_photo(chat_id, col_path, f"Колонка {idx}/{len(column_images)}")
-            except Exception as e:
-                print(f"Не удалось отправить колонку {idx}: {e}")
-
-    doc_type = doc.get("doc_type", "production")
-    items = doc.get("items", [])
-
-    if not items:
-        send_message(chat_id, "Не нашёл ни одной строки с количеством на фото 😔")
-        return
-
-    # Валидация и нормализация названий сразу после OCR
-    send_message(chat_id, "Проверяю товары по каталогу...")
-    
-    try:
-        validated_items, warnings = validate_and_normalize_items(items, doc_type)
-    except Exception as e:
-        send_message(chat_id, f"Ошибка при проверке товаров: {e}")
-        return
-    
-    if not validated_items:
-        send_message(chat_id, "Не удалось распознать ни одной валидной позиции 😔")
-        return
-
-    st["items"] = validated_items
-    st["doc_type"] = doc_type
-    st["pending_confirm"] = True
-
-    label = DOC_TYPE_LABELS.get(doc_type, doc_type)
-    msg = f"Тип документа: {label}\n"
-    msg += "Вот что будет отправлено в СБИС:\n"
-    msg += format_items(validated_items)
-    
-    if warnings:
-        msg += "\n\n⚠️ Предупреждения:\n" + "\n".join(warnings)
-    
-    msg += "\n\nВсе верно?"
-    send_message(chat_id, msg)
 
 
 def handle_callback_query(callback_query: dict):
@@ -1040,9 +947,9 @@ def process_update(update: dict):
         handle_voice(chat_id, msg["voice"])
         return
 
-    # Фото
+    # Фото не поддерживаются
     if "photo" in msg:
-        handle_photo(chat_id, msg["photo"])
+        send_message(chat_id, "📵 Распознавание фото отключено. Используй голосовой или текстовый ввод.")
         return
 
     # Текст
