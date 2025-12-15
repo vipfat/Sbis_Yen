@@ -642,6 +642,7 @@ def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True, return_
 ВЕРНИ ТОЛЬКО ВАЛИДНЫЙ JSON, НИЧЕГО БОЛЬШЕ!
 """
 
+    client = _get_openai_client()
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -848,6 +849,7 @@ def correct_items_with_instruction(items: List[Dict], instruction: str) -> List[
         f"Инструкция пользователя:\n{instruction}\n"
     )
 
+    client = _get_openai_client()
     client = _get_openai_client()
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
