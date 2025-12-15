@@ -19,6 +19,7 @@ from catalog_lookup import ProductNotFoundError, MultipleProductsNotFoundError
 from ocr_gpt import (
     correct_items_with_instruction,
     extract_doc_from_image_gpt,
+    extract_doc_from_image_hybrid,
     transcribe_audio,
 )
 
@@ -820,15 +821,27 @@ def handle_photo(chat_id: int, photos: List[Dict]):
     with open(local_path, "wb") as f:
         f.write(resp.content)
 
-    send_message(chat_id, "Обрабатываю таблицу на фото через GPT...")
+    send_message(chat_id, "Обрабатываю таблицу на фото...")
 
     try:
-        doc = extract_doc_from_image_gpt(str(local_path), return_columns=True)
+        # Гибридное распознавание: Tesseract → GPT fallback
+        doc = extract_doc_from_image_hybrid(str(local_path))
+        
+        # Показываем метод распознавания
+        method = doc.get("method", "unknown")
+        if method == "tesseract":
+            quality = doc.get("quality", {})
+            send_message(chat_id, f"✓ Распознано через Tesseract (быстро, conf={quality.get('avg_confidence', 0):.0f}%)")
+        elif method == "gpt-fallback":
+            send_message(chat_id, "⚡ Использован GPT (Tesseract не справился)")
+        elif method == "gpt":
+            send_message(chat_id, "⚡ Использован GPT")
+            
     except Exception as e:
         send_message(chat_id, f"Ошибка распознавания таблицы: {e}")
         return
 
-    # Если таблица была разделена на колонки - показываем их
+    # Если таблица была разделена на колонки - показываем их (только для GPT)
     column_images = doc.get("column_images", [])
     if column_images and len(column_images) > 1:
         send_message(chat_id, f"📸 Таблица разделена на {len(column_images)} колонок для точного распознавания:")

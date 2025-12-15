@@ -424,6 +424,59 @@ def _preprocess_image_for_ocr(image_path: str) -> str:
     return image_path
 
 
+def extract_doc_from_image_hybrid(image_path: str, force_gpt: bool = False) -> Dict:
+    """
+    Гибридное распознавание: сначала Tesseract (быстро), при низком качестве → GPT.
+    
+    Returns:
+        {
+            "doc_type": str,
+            "items": List[{"name": str, "qty": float}],
+            "method": "tesseract" | "gpt" | "gpt-fallback",
+            "quality": Dict  # метрики качества (если tesseract)
+        }
+    """
+    import sys
+    from ocr_tesseract import extract_table_tesseract, detect_doc_type_simple
+    
+    if force_gpt:
+        print("[HYBRID] Принудительное использование GPT", file=sys.stderr)
+        result = extract_doc_from_image_gpt(image_path, preprocess=True, return_columns=False)
+        result['method'] = 'gpt'
+        return result
+    
+    # Шаг 1: Пробуем Tesseract
+    print("[HYBRID] Попытка распознавания через Tesseract...", file=sys.stderr)
+    tess_items, tess_quality = extract_table_tesseract(image_path)
+    
+    # Шаг 2: Проверяем качество
+    if tess_quality['is_good']:
+        print(f"[HYBRID] ✓ Tesseract: качество хорошее, используем результат", file=sys.stderr)
+        
+        # Определяем тип документа
+        doc_type = detect_doc_type_simple(image_path)
+        if doc_type == 'unknown':
+            doc_type = 'production'  # по умолчанию
+        
+        return {
+            'doc_type': doc_type,
+            'items': tess_items,
+            'method': 'tesseract',
+            'quality': tess_quality,
+        }
+    
+    # Шаг 3: Fallback на GPT
+    print(f"[HYBRID] ✗ Tesseract: качество низкое "
+          f"(conf={tess_quality['avg_confidence']:.1f}%, items={tess_quality['items_count']}), "
+          f"переключаюсь на GPT...", file=sys.stderr)
+    
+    result = extract_doc_from_image_gpt(image_path, preprocess=True, return_columns=False)
+    result['method'] = 'gpt-fallback'
+    result['tesseract_attempt'] = tess_quality
+    
+    return result
+
+
 def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True, return_columns: bool = False) -> Dict:
     """
     Отправляет фото таблицы в GPT и возвращает структуру:
