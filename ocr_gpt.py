@@ -3,6 +3,8 @@ import base64
 import os
 import json
 import re
+import cv2
+from pathlib import Path
 from typing import List, Dict
 
 from dotenv import load_dotenv
