@@ -1,0 +1,16 @@
+[Unit]
+Description=SBIS Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/home/bot/bot_app
+ExecStart=/home/bot/bot_app/venv/bin/python /home/bot/bot_app/bot_simple.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/bot/bot_app/bot.log
+StandardError=append:/home/bot/bot_app/bot.log
+
+[Install]
+WantedBy=multi-user.target
