@@ -79,11 +79,13 @@ def parse_edit_command(text: str, current_items: List[Dict]) -> Optional[Dict]:
    params: {{"items": [{{"name": "...", "qty": число}}, ...]}}
    Примеры: "Борило 2.5", "Лук 1.2 Картофель 3"
    
-6. "unknown" - непонятная команда
-   params: {{"reason": "почему не понял"}}
+6. "unknown" - непонятная команда или обычное добавление позиций
+   params: {{"reason": "это просто список товаров для добавления"}}
 
 ВАЖНО:
 - Если команда начинается с "не X а Y" или "X не N а M" — это rename или change_qty
+- Если текст содержит много пар "Название Число" — это НЕ команда, верни "unknown"
+- Команды редактирования обычно содержат слова: удали, убери, измени, не...а
 - Числа с запятой заменяй на точку: 0,7 → 0.7
 - Названия товаров пиши с заглавной буквы
 - Если в тексте есть название из списка — используй его точно
@@ -96,7 +98,7 @@ def parse_edit_command(text: str, current_items: List[Dict]) -> Optional[Dict]:
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0,
-            max_tokens=300
+            max_tokens=500
         )
         
         result_text = response.choices[0].message.content.strip()
