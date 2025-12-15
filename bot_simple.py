@@ -62,6 +62,27 @@ def send_message(chat_id: int, text: str, reply_markup=None):
     api_post("sendMessage", data)
 
 
+def get_control_buttons() -> dict:
+    """Возвращает стандартные кнопки управления для всех сообщений."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📋 Показать список", "callback_data": "cmd:list"},
+                {"text": "🗑 Удалить позицию", "callback_data": "cmd:delete_menu"}
+            ],
+            [
+                {"text": "🧹 Очистить всё", "callback_data": "cmd:clear"},
+                {"text": "📤 Отправить", "callback_data": "cmd:send"}
+            ]
+        ]
+    }
+
+
+def send_message_with_controls(chat_id: int, text: str):
+    """Отправляет сообщение со стандартными кнопками управления."""
+    send_message(chat_id, text, get_control_buttons())
+
+
 def send_photo(chat_id: int, photo_path: str, caption: str = None):
     """Отправляет фото в чат."""
     url = f"{API_URL}/sendPhoto"
@@ -137,20 +158,31 @@ def transcribe_voice_from_telegram(file_id: str) -> str:
 
 
 def format_items(items: List[Dict]) -> str:
+    """Форматирует список в виде красивой таблицы."""
     if not items:
         return "Список пуст."
     
-    lines = []
-    for i, it in enumerate(items):
-        name = it.get('name', '')
-        catalog_name = it.get('catalog_name')
-        qty = it.get('qty', '')
+    lines = ["📋 Текущий список:\n"]
+    lines.append("┌─────┬──────────────────────────┬──────────┐")
+    lines.append("│  №  │ Название                 │ Кол-во   │")
+    lines.append("├─────┼──────────────────────────┼──────────┤")
+    
+    for i, it in enumerate(items, 1):
+        name = it.get('catalog_name') or it.get('name', '')
+        qty = it.get('qty', 0)
         
-        # Если есть нормализованное название и оно отличается от исходного
-        if catalog_name and catalog_name != name:
-            lines.append(f"{i+1}. {name} → {catalog_name} — {qty}")
-        else:
-            lines.append(f"{i+1}. {name} — {qty}")
+        # Форматируем для выравнивания
+        num_str = f"{i:^3}"
+        name_str = f"{name[:24]:<24}"
+        qty_str = f"{qty:>8.2f}"
+        
+        lines.append(f"│ {num_str} │ {name_str} │ {qty_str} │")
+    
+    lines.append("└─────┴──────────────────────────┴──────────┘")
+    
+    # Показываем общее количество позиций
+    total_qty = sum(it.get('qty', 0) for it in items)
+    lines.append(f"\nВсего позиций: {len(items)}, количество: {total_qty:.2f}")
     
     return "\n".join(lines)
 
@@ -297,18 +329,16 @@ def handle_start(chat_id: int):
 def handle_list(chat_id: int):
     st = get_state(chat_id)
     label = DOC_TYPE_LABELS.get(st["doc_type"], st["doc_type"])
-    send_message(
-        chat_id,
-        f"Тип документа: {label}\n"
-        "Текущий список:\n" + format_items(st["items"])
-    )
+    msg = f"📋 Тип: {label}\n\n"
+    msg += format_items(st["items"])
+    send_message_with_controls(chat_id, msg)
 
 
 def handle_clear(chat_id: int):
     st = get_state(chat_id)
     st["items"] = []
     st["pending_confirm"] = False
-    send_message(chat_id, "Список очищен.")
+    send_message_with_controls(chat_id, "🧹 Список очищен")
 
 
 def validate_and_normalize_items(items: List[Dict], doc_type: str) -> tuple:
@@ -648,11 +678,13 @@ def handle_voice(chat_id: int, voice: Dict):
         send_message(chat_id, "В голосовом не разобрал текст.")
         return
 
-    send_message(chat_id, f"✓ Распознал:\n{text}")
+    send_message_with_controls(chat_id, f"✓ Распознал:\n{text}")
     handle_text(chat_id, text)
 
 
 def handle_text(chat_id: int, text: str):
+    from edit_commands import parse_edit_command, apply_edit_command
+    
     st = get_state(chat_id)
     text = text.strip()
     text_lower = text.lower()
@@ -674,12 +706,12 @@ def handle_text(chat_id: int, text: str):
         st["pending_confirm"] = False
 
         label = DOC_TYPE_LABELS.get(new_doc_type, new_doc_type)
-        send_message(
-            chat_id,
-            f"Режим: {label}.\n"
-            "Вводи позиции в формате «Название Количество» — текстом или голосом.\n"
-            "Когда закончишь — напиши «отправить», я сам поставлю номер и дату."
-        )
+        msg = f"✅ Режим: {label}\n\n"
+        msg += "Теперь можешь:\n"
+        msg += "• Диктовать позиции: «Борило 2,5 Песто 1,2»\n"
+        msg += "• Редактировать: «удали последнюю», «лука не 7 а 0,7»\n"
+        msg += "• Отправить: нажми кнопку или напиши «отправить»"
+        send_message_with_controls(chat_id, msg)
         return
 
     # Явный запрос на отправку текущего списка
@@ -687,53 +719,53 @@ def handle_text(chat_id: int, text: str):
         auto_send_act(chat_id)
         return
 
-    # Если ждём подтверждение после OCR
-    if st["pending_confirm"]:
-        if is_yes(text):
-            auto_send_act(chat_id)
-            return
-
-        # Иначе — это инструкция для правки
-        try:
-            new_items = correct_items_with_instruction(st["items"], text)
-        except Exception as e:
-            send_message(chat_id, f"Не смог применить правку через GPT: {e}")
-            return
-
-        if not new_items:
-            send_message(chat_id, "После правки список пуст. Можешь прислать новую фотку или ввести позиции заново.")
-            st["pending_confirm"] = False
-            return
-
-        # Валидируем и нормализуем отредактированные позиции
-        send_message(chat_id, "Проверяю обновлённый список по каталогу...")
-        try:
-            validated_items, warnings = validate_and_normalize_items(new_items, st["doc_type"])
-        except Exception as e:
-            send_message(chat_id, f"Ошибка при проверке товаров: {e}")
-            return
-
-        if not validated_items:
-            send_message(chat_id, "После правки не осталось валидных позиций 😔")
-            st["pending_confirm"] = False
-            return
-
-        st["items"] = validated_items
-
-        label = DOC_TYPE_LABELS.get(st["doc_type"], st["doc_type"])
-        msg = f"Тип документа: {label}\n"
-        msg += "Обновлённый список (будет отправлено в СБИС):\n"
-        msg += format_items(validated_items)
+    # Пробуем распознать как команду редактирования
+    if st["items"]:  # Если уже есть позиции - может быть команда редактирования
+        edit_cmd = parse_edit_command(text, st["items"])
         
-        if warnings:
-            msg += "\n\n⚠️ Предупреждения:\n" + "\n".join(warnings)
-        
-        msg += "\n\nВсе верно?"
-        send_message(chat_id, msg)
-        # остаёмся в pending_confirm
-        return
+        if edit_cmd and edit_cmd.get("action") != "unknown":
+            new_items, result_msg = apply_edit_command(edit_cmd, st["items"])
+            
+            # Специальный случай: добавление новых позиций
+            if result_msg.startswith("add:"):
+                items_to_add = json.loads(result_msg[4:])
+                # Валидируем новые позиции
+                send_message(chat_id, "Проверяю новые позиции...")
+                try:
+                    validated, warnings = validate_and_normalize_items(items_to_add, st["doc_type"])
+                    if validated:
+                        st["items"].extend(validated)
+                        msg = "✅ Добавил:\n" + format_items(st["items"])
+                        if warnings:
+                            msg += "\n\n⚠️ " + "\n".join(warnings)
+                        send_message_with_controls(chat_id, msg)
+                    else:
+                        send_message_with_controls(chat_id, "❌ Не смог добавить позиции")
+                except Exception as e:
+                    send_message_with_controls(chat_id, f"❌ Ошибка: {e}")
+                return
+            
+            # Обычное редактирование
+            st["items"] = new_items
+            
+            # Если команда rename - нужно ревалидировать
+            if edit_cmd.get("action") == "rename":
+                send_message(chat_id, "Проверяю новое название...")
+                try:
+                    validated, warnings = validate_and_normalize_items(new_items, st["doc_type"])
+                    st["items"] = validated
+                    result_msg += "\n\n" + format_items(validated)
+                    if warnings:
+                        result_msg += "\n\n⚠️ " + "\n".join(warnings)
+                except Exception as e:
+                    result_msg += f"\n❌ Ошибка валидации: {e}"
+            else:
+                result_msg += "\n\n" + format_items(new_items)
+            
+            send_message_with_controls(chat_id, result_msg)
+            return
 
-    # Обычный режим: ручной ввод «Название Количество»
+    # Обычный режим: парсим как добавление позиций «Название Количество»
     items, errors = parse_items_from_text(text)
     if not items:
         send_message(
@@ -769,9 +801,8 @@ def handle_text(chat_id: int, text: str):
     # Добавляем валидированные позиции
     if valid_items:
         st["items"].extend(valid_items)
-        msg = "✅ Добавил (будет отправлено в СБИС):\n"
-        msg += format_items(valid_items)
-        send_message(chat_id, msg)
+        msg = "✅ Добавил:\n" + format_items(st["items"])
+        send_message_with_controls(chat_id, msg)
     
     # Для невалидированных показываем кнопки с вариантами
     for item in invalid_items:
@@ -808,13 +839,64 @@ def handle_callback_query(callback_query: dict):
     # Подтверждаем получение callback
     api_post("answerCallbackQuery", {"callback_query_id": query_id})
     
-    # Парсим callback_data: "prod:item_index:choice_index" или "prod:item_index:skip"
-    if not data.startswith("prod:"):
+    st = get_state(chat_id)
+    
+    # Команды управления: cmd:action
+    if data.startswith("cmd:"):
+        action = data.split(":")[1]
+        
+        if action == "list":
+            label = DOC_TYPE_LABELS.get(st["doc_type"], st["doc_type"])
+            msg = f"📋 Тип: {label}\n\n"
+            msg += format_items(st["items"])
+            send_message_with_controls(chat_id, msg)
+            return
+        
+        elif action == "clear":
+            st["items"] = []
+            send_message_with_controls(chat_id, "🧹 Список очищен")
+            return
+        
+        elif action == "delete_menu":
+            if not st["items"]:
+                send_message_with_controls(chat_id, "Список пуст, нечего удалять")
+                return
+            
+            # Показываем кнопки с позициями для удаления
+            buttons = []
+            for i, item in enumerate(st["items"]):
+                name = item.get("catalog_name") or item.get("name")
+                qty = item.get("qty", 0)
+                button_text = f"{i+1}. {name} ({qty})"
+                buttons.append([{"text": button_text, "callback_data": f"del:{i}"}])
+            
+            buttons.append([{"text": "❌ Отмена", "callback_data": "cmd:list"}])
+            
+            send_message(chat_id, "Выбери позицию для удаления:", {"inline_keyboard": buttons})
+            return
+        
+        elif action == "send":
+            auto_send_act(chat_id)
+            return
+    
+    # Удаление позиции: del:index
+    if data.startswith("del:"):
+        index = int(data.split(":")[1])
+        if 0 <= index < len(st["items"]):
+            removed = st["items"].pop(index)
+            name = removed.get("catalog_name") or removed.get("name")
+            msg = f"✓ Удалил: {name}\n\n"
+            msg += format_items(st["items"])
+            send_message_with_controls(chat_id, msg)
+        else:
+            send_message_with_controls(chat_id, "❌ Позиция не найдена")
         return
     
-    parts = data.split(":")
-    if len(parts) != 3:
-        return
+    # Выбор товара из каталога: prod:item_index:choice_index
+    if data.startswith("prod:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            return
     
     _, item_index_str, choice = parts
     item_index = int(item_index_str)
