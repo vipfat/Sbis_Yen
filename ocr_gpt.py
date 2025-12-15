@@ -424,57 +424,191 @@ def _preprocess_image_for_ocr(image_path: str) -> str:
     return image_path
 
 
-def extract_doc_from_image_hybrid(image_path: str, force_gpt: bool = False) -> Dict:
+async def extract_row_data_gpt(row_image_path: str, row_index: int) -> Dict:
     """
-    Гибридное распознавание: сначала Tesseract (быстро), при низком качестве → GPT.
+    Извлекает данные из одной строки таблицы через GPT с Structured Output.
     
+    Args:
+        row_image_path: Путь к изображению строки
+        row_index: Номер строки (для логирования)
+        
     Returns:
-        {
-            "doc_type": str,
-            "items": List[{"name": str, "qty": float}],
-            "method": "tesseract" | "gpt" | "gpt-fallback",
-            "quality": Dict  # метрики качества (если tesseract)
-        }
+        {"name": str, "qty": float, "has_data": bool}
     """
     import sys
-    from ocr_tesseract import extract_table_tesseract, detect_doc_type_simple
     
-    if force_gpt:
-        print("[HYBRID] Принудительное использование GPT", file=sys.stderr)
+    b64 = encode_image(row_image_path)
+    
+    prompt = """Ты — система OCR для одной строки таблицы кафе.
+
+Задача: извлечь НАЗВАНИЕ (слева) и КОЛИЧЕСТВО (справа) из этой строки.
+
+Правила:
+1. Если строка пустая или нет количества → has_data = false
+2. Название — это текст в левой части строки
+3. Количество — это ПОСЛЕДНЕЕ число в правой части строки
+4. Количество должно быть > 0
+5. Убери единицы измерения из количества (кг, г, л и т.п.)
+
+Формат ответа — ТОЛЬКО JSON:
+{
+  "name": "название товара" или "",
+  "qty": число или 0,
+  "has_data": true/false
+}"""
+
+    client = _get_openai_client()
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]
+            }],
+            response_format={"type": "json_object"},
+            max_tokens=200,
+            temperature=0
+        )
+        
+        text = response.choices[0].message.content or "{}"
+        data = _parse_json_strict_or_relaxed(text)
+        
+        # Валидация
+        has_data = data.get("has_data", False)
+        name = str(data.get("name", "")).strip()
+        qty = float(data.get("qty", 0))
+        
+        print(f"[ROW {row_index:3d}] {'✓' if has_data else '○'} {name[:30]:30s} qty={qty}", 
+              file=sys.stderr)
+        
+        return {"name": name, "qty": qty, "has_data": has_data}
+        
+    except Exception as e:
+        print(f"[ROW {row_index:3d}] ✗ Ошибка: {e}", file=sys.stderr)
+        return {"name": "", "qty": 0, "has_data": False}
+
+
+async def process_rows_parallel(row_images: List[str]) -> List[Dict]:
+    """
+    Обрабатывает строки таблицы параллельно через GPT.
+    
+    Returns:
+        List[{"name": str, "qty": float}]
+    """
+    import asyncio
+    
+    print(f"[PARALLEL] Обработка {len(row_images)} строк...", file=sys.stderr)
+    
+    # Создаем задачи для всех строк
+    tasks = [extract_row_data_gpt(img, idx) for idx, img in enumerate(row_images)]
+    
+    # Запускаем параллельно
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Фильтруем только строки с данными
+    items = []
+    for result in results:
+        if isinstance(result, dict) and result.get("has_data") and result.get("name"):
+            items.append({"name": result["name"], "qty": result["qty"]})
+    
+    print(f"[PARALLEL] Распознано позиций: {len(items)}/{len(row_images)}", file=sys.stderr)
+    
+    return items
+
+
+def extract_doc_from_image_rowwise(image_path: str) -> Dict:
+    """
+    Распознавание таблицы через нарезку на строки + параллельный GPT.
+    
+    Алгоритм:
+    1. Детектируем строки таблицы (OpenCV)
+    2. Нарезаем на отдельные изображения
+    3. Обрабатываем каждую строку через GPT параллельно
+    4. Собираем результаты
+    
+    Returns:
+        {"doc_type": str, "items": List[{"name": str, "qty": float}], "method": "rowwise"}
+    """
+    import asyncio
+    import sys
+    from table_row_detector import detect_table_rows, split_table_into_rows
+    
+    print(f"[ROWWISE] Начинаю обработку: {Path(image_path).name}", file=sys.stderr)
+    
+    # Шаг 1: Детектируем строки
+    rows = detect_table_rows(image_path, min_row_height=15)
+    
+    if len(rows) == 0:
+        print("[ROWWISE] Не обнаружено строк, fallback на стандартный GPT", file=sys.stderr)
         result = extract_doc_from_image_gpt(image_path, preprocess=True, return_columns=False)
-        result['method'] = 'gpt'
+        result['method'] = 'gpt-fallback'
         return result
     
-    # Шаг 1: Пробуем Tesseract
-    print("[HYBRID] Попытка распознавания через Tesseract...", file=sys.stderr)
-    tess_items, tess_quality = extract_table_tesseract(image_path)
+    # Шаг 2: Нарезаем на строки
+    row_images = split_table_into_rows(image_path, rows)
     
-    # Шаг 2: Проверяем качество
-    if tess_quality['is_good']:
-        print(f"[HYBRID] ✓ Tesseract: качество хорошее, используем результат", file=sys.stderr)
+    # Шаг 3: Обрабатываем параллельно
+    items = asyncio.run(process_rows_parallel(row_images))
+    
+    # Шаг 4: Определяем тип документа из заголовка
+    doc_type = _detect_doc_type_from_header(image_path)
+    
+    return {
+        "doc_type": doc_type,
+        "items": items,
+        "method": "rowwise",
+        "rows_detected": len(rows),
+        "rows_with_data": len(items)
+    }
+
+
+def _detect_doc_type_from_header(image_path: str) -> str:
+    """Быстрая детекция типа документа из заголовка (верхние 10% изображения)."""
+    import sys
+    
+    img = cv2.imread(image_path)
+    h = img.shape[0]
+    header = img[:int(h * 0.1), :]
+    
+    # Сохраняем заголовок
+    header_path = str(Path(image_path).parent / "tmp_header.jpg")
+    cv2.imwrite(header_path, header)
+    
+    b64 = encode_image(header_path)
+    
+    prompt = """Это заголовок таблицы. Определи тип документа:
+- "production" если видишь "Производство"
+- "writeoff" если видишь "Списание"
+- "income" если видишь "Приход"
+
+Ответ — ТОЛЬКО одно слово: production, writeoff или income"""
+    
+    try:
+        client = _get_openai_client()
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]
+            }],
+            max_tokens=20,
+            temperature=0
+        )
         
-        # Определяем тип документа
-        doc_type = detect_doc_type_simple(image_path)
-        if doc_type == 'unknown':
-            doc_type = 'production'  # по умолчанию
-        
-        return {
-            'doc_type': doc_type,
-            'items': tess_items,
-            'method': 'tesseract',
-            'quality': tess_quality,
-        }
+        doc_type = response.choices[0].message.content.strip().lower()
+        if doc_type in ["production", "writeoff", "income"]:
+            return doc_type
+    except Exception as e:
+        print(f"[DOCTYPE] Ошибка определения типа: {e}", file=sys.stderr)
     
-    # Шаг 3: Fallback на GPT
-    print(f"[HYBRID] ✗ Tesseract: качество низкое "
-          f"(conf={tess_quality['avg_confidence']:.1f}%, items={tess_quality['items_count']}), "
-          f"переключаюсь на GPT...", file=sys.stderr)
-    
-    result = extract_doc_from_image_gpt(image_path, preprocess=True, return_columns=False)
-    result['method'] = 'gpt-fallback'
-    result['tesseract_attempt'] = tess_quality
-    
-    return result
+    return "production"  # по умолчанию
 
 
 def extract_doc_from_image_gpt(image_path: str, preprocess: bool = True, return_columns: bool = False) -> Dict:

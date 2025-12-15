@@ -19,7 +19,7 @@ from catalog_lookup import ProductNotFoundError, MultipleProductsNotFoundError
 from ocr_gpt import (
     correct_items_with_instruction,
     extract_doc_from_image_gpt,
-    extract_doc_from_image_hybrid,
+    extract_doc_from_image_rowwise,
     transcribe_audio,
 )
 
@@ -825,7 +825,7 @@ def handle_photo(chat_id: int, photos: List[Dict]):
 
     try:
         # Гибридное распознавание: Tesseract → GPT fallback
-        doc = extract_doc_from_image_hybrid(str(local_path))
+        doc = extract_doc_from_image_rowwise(str(local_path))
         
         # Показываем метод распознавания
         method = doc.get("method", "unknown")
