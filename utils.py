@@ -230,6 +230,35 @@ def truncate_text(text: str, max_length: int = 100, suffix: str = "...") -> str:
         return text
     return text[:max_length - len(suffix)] + suffix
 
+def summarize_validation(validated_items: list, warnings: list) -> dict:
+    """Подсчёт метрик валидации для отчётов/логов.
+
+    Возвращает словарь с метриками:
+    - total: всего позиций на входе (validated_items)
+    - matched: сколько имеют `catalog_name`
+    - unmatched: сколько без `catalog_name`
+    - warning_count: число предупреждений
+    - matched_ratio: доля совпадений (0..1)
+    - qty_sum: суммарное количество
+    """
+    total = len(validated_items or [])
+    matched = sum(1 for it in validated_items if it.get("catalog_name"))
+    qty_sum = 0.0
+    for it in validated_items:
+        try:
+            qty_sum += float(it.get("qty", 0) or 0)
+        except Exception:
+            pass
+    result = {
+        "total": total,
+        "matched": matched,
+        "unmatched": max(0, total - matched),
+        "warning_count": len(warnings or []),
+        "matched_ratio": (matched / total) if total else 0.0,
+        "qty_sum": qty_sum,
+    }
+    return result
+
 
 def generate_doc_number(prefix: str = "AUTO") -> str:
     """

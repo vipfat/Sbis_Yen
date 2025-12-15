@@ -25,10 +25,9 @@ from ocr_gpt import (
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-if not TOKEN:
-    raise RuntimeError("В .env не найден TELEGRAM_BOT_TOKEN")
-
-API_URL = f"https://api.telegram.org/bot{TOKEN}"
+# Не падаем при импорте, если токен не задан (для тестов);
+# сетевые функции проверят наличие токена при вызове.
+API_URL = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else None
 
 # Память по пользователям:
 # items: список позиций
@@ -227,21 +226,39 @@ def _smart_parse_quantity(parts: list) -> tuple:
 
 
 def parse_items_from_text(text: str):
-    """Достаём из строки позиции вида "Название Количество", перечисленные через запятую/перенос."""
+    """Достаём из строки позиции вида "Название Количество", перечисленные через разделители.
 
-    chunks = [c.strip() for c in re.split(r"[,\n;]+", text) if c.strip()]
+    Особенности:
+    - Не считаем запятую разделителем, если она между цифрами ("2,170").
+    - Разделяем по точке только когда это конец предложения ("." далее пробел/конец).
+    - Очищаем хвостовую пунктуацию у фрагментов.
+    - Умный парсинг чисел: "2 0.97" → 2.97, "0,44" → 0.44.
+    """
+
+    # Разделители между позициями: переносы строк, точка на границе предложения, точка с запятой,
+    # запятая не между цифрами.
+    separator_regex = r"(?:\n|;|(?<!\d)\,(?!\d)|\.(?=\s|$))"
+    raw_chunks = re.split(separator_regex, text or "")
+    chunks = []
+    for c in raw_chunks:
+        c = c.strip()
+        if not c:
+            continue
+        # Удаляем завершающую пунктуацию
+        c = re.sub(r"[\.,;:]+$", "", c).strip()
+        if c:
+            chunks.append(c)
+
     items = []
     errors = []
 
     for chunk in chunks:
-        parts = chunk.split()
-        
+        chunk_norm = re.sub(r"\s+", " ", chunk).strip()
+        parts = chunk_norm.split()
         name, qty = _smart_parse_quantity(parts)
-        
         if name is None or qty is None:
             errors.append(chunk)
             continue
-
         items.append({"name": name, "qty": qty})
 
     return items, errors

@@ -10,11 +10,21 @@ from openai import OpenAI
 
 # Загружаем переменные окружения
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("В .env не найден OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+_OPENAI_CLIENT = None
+
+def _get_openai_client() -> OpenAI:
+    """Ленивая инициализация клиента OpenAI.
+    Не падаем при импорте модуля, а только при первом обращении к API.
+    """
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is not None:
+        return _OPENAI_CLIENT
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("В .env не найден OPENAI_API_KEY")
+    _OPENAI_CLIENT = OpenAI(api_key=api_key)
+    return _OPENAI_CLIENT
 
 
 def _log_ocr_result(image_path: str, gpt_response: str):
@@ -39,7 +49,7 @@ def _log_ocr_result(image_path: str, gpt_response: str):
 
 def transcribe_audio(file_path: str) -> str:
     """Преобразуем аудио-файл (голосовое) в текст через Whisper."""
-
+    client = _get_openai_client()
     with open(file_path, "rb") as f:
         result = client.audio.transcriptions.create(
             model="whisper-1",
@@ -264,6 +274,7 @@ def _process_single_column(image_path: str, col_num: int, total_cols: int) -> Di
 БЕЗ trailing commas! БЕЗ markdown! ТОЛЬКО JSON!
 """
     
+    client = _get_openai_client()
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -784,6 +795,7 @@ def correct_items_with_instruction(items: List[Dict], instruction: str) -> List[
         f"Инструкция пользователя:\n{instruction}\n"
     )
 
+    client = _get_openai_client()
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
