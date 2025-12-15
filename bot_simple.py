@@ -39,7 +39,36 @@ def get_state(chat_id: int) -> Dict:
     st.setdefault("doc_type", "production")
     st.setdefault("pending_product_choice", None)  # Текущий спорный товар
     st.setdefault("pending_errors_queue", [])  # Очередь остальных спорных товаров
+    st.setdefault("history", [])  # История состояний для отмены (последние 5)
+    st.setdefault("pending_edit_qty", None)  # Ожидание ввода нового количества {"item_index": int}
     return st
+
+
+def save_state_to_history(chat_id: int):
+    """Сохраняет текущее состояние в историю для возможности отмены."""
+    st = get_state(chat_id)
+    # Сохраняем копию items и doc_type
+    snapshot = {
+        "items": [item.copy() for item in st["items"]],
+        "doc_type": st["doc_type"]
+    }
+    st["history"].append(snapshot)
+    # Храним только последние 5 состояний
+    if len(st["history"]) > 5:
+        st["history"] = st["history"][-5:]
+
+
+def undo_last_action(chat_id: int) -> bool:
+    """Отменяет последнее действие, возвращая предыдущее состояние. Returns True если успешно."""
+    st = get_state(chat_id)
+    if not st["history"]:
+        return False
+    
+    # Восстанавливаем предыдущее состояние
+    previous = st["history"].pop()
+    st["items"] = previous["items"]
+    st["doc_type"] = previous["doc_type"]
+    return True
 
 
 def api_get(method: str, params: dict = None):
@@ -62,25 +91,33 @@ def send_message(chat_id: int, text: str, reply_markup=None):
     api_post("sendMessage", data)
 
 
-def get_control_buttons() -> dict:
+def get_control_buttons(show_undo: bool = False) -> dict:
     """Возвращает стандартные кнопки управления для всех сообщений."""
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "📋 Показать список", "callback_data": "cmd:list"},
-                {"text": "🗑 Удалить позицию", "callback_data": "cmd:delete_menu"}
-            ],
-            [
-                {"text": "🧹 Очистить всё", "callback_data": "cmd:clear"},
-                {"text": "📤 Отправить", "callback_data": "cmd:send"}
-            ]
+    buttons = [
+        [
+            {"text": "📋 Показать список", "callback_data": "cmd:list"},
+            {"text": "🗑 Удалить позицию", "callback_data": "cmd:delete_menu"}
+        ],
+        [
+            {"text": "🧹 Очистить всё", "callback_data": "cmd:clear"},
+            {"text": "📤 Отправить", "callback_data": "cmd:send"}
         ]
-    }
+    ]
+    
+    # Добавляем кнопку Отменить если есть история
+    if show_undo:
+        buttons.append([
+            {"text": "↩️ Отменить последнее", "callback_data": "cmd:undo"}
+        ])
+    
+    return {"inline_keyboard": buttons}
 
 
 def send_message_with_controls(chat_id: int, text: str):
     """Отправляет сообщение со стандартными кнопками управления."""
-    send_message(chat_id, text, get_control_buttons())
+    st = get_state(chat_id)
+    show_undo = len(st.get("history", [])) > 0
+    send_message(chat_id, text, get_control_buttons(show_undo))
 
 
 def send_photo(chat_id: int, photo_path: str, caption: str = None):
@@ -157,12 +194,14 @@ def transcribe_voice_from_telegram(file_id: str) -> str:
     return transcribe_audio(str(local_path))
 
 
-def format_items(items: List[Dict]) -> str:
-    """Форматирует список в виде красивой таблицы."""
+def format_items(items: List[Dict], doc_type: str = "production") -> str:
+    """Форматирует список в виде красивой таблицы с индикатором режима."""
     if not items:
         return "Список пуст."
     
-    lines = ["📋 Текущий список:\n"]
+    emoji = DOC_TYPE_EMOJI.get(doc_type, "📋")
+    label = DOC_TYPE_LABELS.get(doc_type, doc_type)
+    lines = [f"{emoji} {label}\n"]
     lines.append("┌─────┬──────────────────────────┬───────────┐")
     lines.append("│  №  │ Название                 │ Кол-во    │")
     lines.append("├─────┼──────────────────────────┼───────────┤")
@@ -297,9 +336,15 @@ def parse_items_from_text(text: str):
 
 
 DOC_TYPE_LABELS = {
-    "production": "Производство",
-    "writeoff": "Списание",
-    "income": "Приход",
+    "production": "🏭 Производство",
+    "writeoff": "🗑 Списание",
+    "income": "📦 Приход",
+}
+
+DOC_TYPE_EMOJI = {
+    "production": "🏭",
+    "writeoff": "🗑",
+    "income": "📦",
 }
 
 
@@ -332,9 +377,7 @@ def handle_start(chat_id: int):
 
 def handle_list(chat_id: int):
     st = get_state(chat_id)
-    label = DOC_TYPE_LABELS.get(st["doc_type"], st["doc_type"])
-    msg = f"📋 Тип: {label}\n\n"
-    msg += format_items(st["items"])
+    msg = format_items(st["items"], st["doc_type"])
     send_message_with_controls(chat_id, msg)
 
 
@@ -647,6 +690,13 @@ def handle_command(chat_id: int, text: str):
         handle_clear(chat_id)
     elif cmd == "/send":
         handle_send_manual(chat_id, args)
+    elif cmd == "/cancel":
+        st = get_state(chat_id)
+        if st.get("pending_edit_qty"):
+            st["pending_edit_qty"] = None
+            send_message_with_controls(chat_id, "✓ Отменил редактирование")
+        else:
+            send_message(chat_id, "Нечего отменять")
     else:
         send_message(chat_id, "Неизвестная команда.")
 
@@ -697,6 +747,36 @@ def handle_text(chat_id: int, text: str):
     if text.startswith("/"):
         handle_command(chat_id, text)
         return
+    
+    # Ожидание ввода нового количества для редактирования
+    if st.get("pending_edit_qty"):
+        edit_info = st["pending_edit_qty"]
+        item_index = edit_info["item_index"]
+        
+        try:
+            new_qty = float(text.replace(",", "."))
+            if new_qty <= 0:
+                send_message(chat_id, "❌ Количество должно быть больше нуля")
+                return
+            
+            if 0 <= item_index < len(st["items"]):
+                save_state_to_history(chat_id)
+                item = st["items"][item_index]
+                old_qty = item["qty"]
+                item["qty"] = new_qty
+                
+                name = item.get("catalog_name") or item.get("name")
+                msg = f"✓ Изменил количество:\n{name}: {old_qty:.3f} → {new_qty:.3f}\n\n"
+                msg += format_items(st["items"], st["doc_type"])
+                
+                st["pending_edit_qty"] = None
+                send_message_with_controls(chat_id, msg)
+            else:
+                send_message_with_controls(chat_id, "❌ Позиция не найдена")
+                st["pending_edit_qty"] = None
+        except ValueError:
+            send_message(chat_id, "❌ Неверный формат. Введи число (например: 2.5)")
+        return
 
     # Быстрая смена типа документа текстом
     if text_lower in {"производство", "списание", "приход"}:
@@ -743,8 +823,9 @@ def handle_text(chat_id: int, text: str):
                 try:
                     validated, warnings = validate_and_normalize_items(items_to_add, st["doc_type"])
                     if validated:
+                        save_state_to_history(chat_id)  # Сохраняем состояние перед изменением
                         st["items"].extend(validated)
-                        msg = "✅ Добавил:\n" + format_items(st["items"])
+                        msg = "✅ Добавил:\n" + format_items(st["items"], st["doc_type"])
                         if warnings:
                             msg += "\n\n⚠️ " + "\n".join(warnings)
                         send_message_with_controls(chat_id, msg)
@@ -763,13 +844,13 @@ def handle_text(chat_id: int, text: str):
                 try:
                     validated, warnings = validate_and_normalize_items(new_items, st["doc_type"])
                     st["items"] = validated
-                    result_msg += "\n\n" + format_items(validated)
+                    result_msg += "\n\n" + format_items(validated, st["doc_type"])
                     if warnings:
                         result_msg += "\n\n⚠️ " + "\n".join(warnings)
                 except Exception as e:
                     result_msg += f"\n❌ Ошибка валидации: {e}"
             else:
-                result_msg += "\n\n" + format_items(new_items)
+                result_msg += "\n\n" + format_items(new_items, st["doc_type"])
             
             send_message_with_controls(chat_id, result_msg)
             return
@@ -809,8 +890,9 @@ def handle_text(chat_id: int, text: str):
     
     # Добавляем валидированные позиции
     if valid_items:
+        save_state_to_history(chat_id)  # Сохраняем перед изменением
         st["items"].extend(valid_items)
-        msg = "✅ Добавил:\n" + format_items(st["items"])
+        msg = "✅ Добавил:\n" + format_items(st["items"], st["doc_type"])
         send_message_with_controls(chat_id, msg)
     
     # Для невалидированных показываем кнопки с вариантами
@@ -855,15 +937,22 @@ def handle_callback_query(callback_query: dict):
         action = data.split(":")[1]
         
         if action == "list":
-            label = DOC_TYPE_LABELS.get(st["doc_type"], st["doc_type"])
-            msg = f"📋 Тип: {label}\n\n"
-            msg += format_items(st["items"])
+            msg = format_items(st["items"], st["doc_type"])
             send_message_with_controls(chat_id, msg)
             return
         
         elif action == "clear":
+            save_state_to_history(chat_id)
             st["items"] = []
             send_message_with_controls(chat_id, "🧹 Список очищен")
+            return
+        
+        elif action == "undo":
+            if undo_last_action(chat_id):
+                msg = "↩️ Отменил последнее действие\n\n" + format_items(st["items"], st["doc_type"])
+                send_message_with_controls(chat_id, msg)
+            else:
+                send_message_with_controls(chat_id, "❌ Нет действий для отмены")
             return
         
         elif action == "delete_menu":
@@ -871,17 +960,20 @@ def handle_callback_query(callback_query: dict):
                 send_message_with_controls(chat_id, "Список пуст, нечего удалять")
                 return
             
-            # Показываем кнопки с позициями для удаления
+            # Показываем кнопки с позициями для удаления/редактирования
             buttons = []
             for i, item in enumerate(st["items"]):
                 name = item.get("catalog_name") or item.get("name")
                 qty = item.get("qty", 0)
-                button_text = f"{i+1}. {name} ({qty})"
-                buttons.append([{"text": button_text, "callback_data": f"del:{i}"}])
+                button_text = f"{i+1}. {name} ({qty:.3f})"
+                buttons.append([
+                    {"text": f"❌ {button_text}", "callback_data": f"del:{i}"},
+                    {"text": "✏️", "callback_data": f"edit:{i}"}
+                ])
             
-            buttons.append([{"text": "❌ Отмена", "callback_data": "cmd:list"}])
+            buttons.append([{"text": "🔙 Назад", "callback_data": "cmd:list"}])
             
-            send_message(chat_id, "Выбери позицию для удаления:", {"inline_keyboard": buttons})
+            send_message(chat_id, "Выбери действие:", {"inline_keyboard": buttons})
             return
         
         elif action == "send":
@@ -892,11 +984,32 @@ def handle_callback_query(callback_query: dict):
     if data.startswith("del:"):
         index = int(data.split(":")[1])
         if 0 <= index < len(st["items"]):
+            save_state_to_history(chat_id)
             removed = st["items"].pop(index)
             name = removed.get("catalog_name") or removed.get("name")
             msg = f"✓ Удалил: {name}\n\n"
-            msg += format_items(st["items"])
+            msg += format_items(st["items"], st["doc_type"])
             send_message_with_controls(chat_id, msg)
+        else:
+            send_message_with_controls(chat_id, "❌ Позиция не найдена")
+        return
+    
+    # Редактирование количества: edit:index
+    if data.startswith("edit:"):
+        index = int(data.split(":")[1])
+        if 0 <= index < len(st["items"]):
+            item = st["items"][index]
+            name = item.get("catalog_name") or item.get("name")
+            current_qty = item.get("qty", 0)
+            
+            st["pending_edit_qty"] = {"item_index": index}
+            
+            msg = f"✏️ Редактирование количества\n\n"
+            msg += f"📦 {name}\n"
+            msg += f"⚖️ Текущее: {current_qty:.3f}\n\n"
+            msg += "Напиши новое количество (или /cancel для отмены):"
+            
+            send_message(chat_id, msg)
         else:
             send_message_with_controls(chat_id, "❌ Позиция не найдена")
         return
